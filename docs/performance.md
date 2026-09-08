@@ -1,6 +1,9 @@
 # Single-GPU serving performance
 
-Tested Git revisions:
+Published measurements use one NVIDIA GeForce RTX 5090 through NInfer's public HTTP serving route.
+Choose a model below for its detailed results, run conditions, output limitations, and reproduction
+commands. These are recorded historical measurements; a model/backend being supported does not
+mean every workload or concurrency has a published measurement.
 
 - Qwen3.8-27B NVFP4 MTP0 context-length serving:
   `f08597d6eaafce5b875934aaa85854fcd5426df8`;
@@ -29,14 +32,25 @@ speculative-decode corpus at C=1, 2, 4, and 8; its C=1 point also supplies the s
 results below. The registered Qwen3.8-27B `groupwise-int` profile remains outside the published
 benchmark campaign.
 
-The single-request corpus requests were submitted serially to a persistent `ninfer-serve` process
-over the loopback OpenAI-compatible HTTP endpoint. Each reported corpus fixture used five fixed
-seeds. Values are arithmetic mean ± sample standard deviation, and server warm-up completes before
-the measured requests. The concurrent campaign has its own sustained-wave method below.
+Each cell links to the relevant result section. “Not published” describes measurement coverage,
+not product support. C is configured request concurrency; K is the number of draft tokens.
 
-## Single-request serving performance method
+| Model / weights | MTP0 context profile | Single-request speculative decode | Corpus makespan | MTP3 decode saturation |
+|---|---|---|---|---|
+| Qwen3.6-27B / `groupwise-int` | [8K–256K](performance/qwen3.6-27b.md#no-speculation-context-profile) | [MTP3](performance/qwen3.6-27b.md#single-request-speculative-decode) | Not published | [C=1, 2, 4, 8](performance/qwen3.6-27b.md#decode-saturation) |
+| Qwen3.6-27B / `nvfp4` | [8K–256K](performance/qwen3.6-27b.md#no-speculation-context-profile) | [MTP3](performance/qwen3.6-27b.md#single-request-speculative-decode) | Not published | [C=1, 2, 4, 8](performance/qwen3.6-27b.md#decode-saturation) |
+| Qwen3.6-35B-A3B / `groupwise-int` | [8K–256K](performance/qwen3.6-35b-a3b.md#no-speculation-context-profile) | [MTP3; DFlash K=7 stochastic/greedy](performance/qwen3.6-35b-a3b.md#single-request-speculative-decode) | [MTP3 C=1, 2, 4, 8; DFlash C=1](performance/qwen3.6-35b-a3b.md#corpus-makespan) | [C=1, 2, 4, 8](performance/qwen3.6-35b-a3b.md#decode-saturation) |
+| Qwen3.8-27B / `groupwise-int` | [8K–256K](performance/qwen3.8-27b.md#no-speculation-context-profile) | [MTP3; DFlash2 K=7](performance/qwen3.8-27b.md#single-request-speculative-decode) | [MTP3 C=1, 2, 4, 8; DFlash2 C=1](performance/qwen3.8-27b.md#corpus-makespan) | Not published |
+| Qwen3.8-27B / `nvfp4` | [8K–256K](performance/qwen3.8-27b.md#no-speculation-context-profile) | [MTP3; DFlash2 K=7](performance/qwen3.8-27b.md#single-request-speculative-decode) | [MTP3 C=1, 2, 4, 8; DFlash2 C=1](performance/qwen3.8-27b.md#corpus-makespan) | [C=1, 2, 4, 8](performance/qwen3.8-27b.md#decode-saturation) |
 
-| Setting | Value |
+Qwen3.8 and Qwen3.6-35B-A3B C=1 corpus points also supply their single-request phase tables.
+The Qwen3.6-27B NVFP4 MTP3 phase table comes from a corpus C=1 point whose full makespan is
+not published here. The Qwen3.8 NVFP4 saturation reports retain configuration and
+values but no tested Git revision; the model page records that provenance limitation.
+
+## Reading the results
+
+| Question | Metric to use |
 |---|---|
 | GPU | NVIDIA GeForce RTX 5090, 32 GiB |
 | CUDA compile/runtime | 13.1 / 13.1 |

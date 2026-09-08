@@ -13,7 +13,6 @@ namespace {
 
 constexpr std::int32_t kHeadDim       = 128;
 constexpr std::int32_t kKVHeads       = 8;
-constexpr std::uint32_t kWindow       = 4096;
 constexpr std::int32_t kFullHeadDim   = 256;
 constexpr const char* kAppendOp       = "kv_cache_append";
 constexpr const char* kPrefixAppendOp = "kv_cache_append_prefix";
@@ -165,7 +164,8 @@ void validate_paged_cache(const PagedKVBatchLayerView& cache,
 
 void validate_cyclic_cache(const CyclicKVCacheLayerView& cache,
                            KVCacheAppendPrefixExecutionEnvelope envelope) {
-    if (cache.num_kv_heads != kKVHeads || cache.head_dim != kHeadDim || cache.capacity != kWindow ||
+    const bool registered_capacity = cache.capacity == 2048 || cache.capacity == 4096;
+    if (cache.num_kv_heads != kKVHeads || cache.head_dim != kHeadDim || !registered_capacity ||
         cache.padded_capacity < cache.capacity ||
         cache.padded_capacity >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
@@ -173,7 +173,7 @@ void validate_cyclic_cache(const CyclicKVCacheLayerView& cache,
         throw std::invalid_argument("kv_cache_append_prefix: invalid cyclic cache");
     }
     const auto padded = static_cast<std::int32_t>(cache.padded_capacity);
-    if (cache.k.dtype != DType::BF16 || cache.v.dtype != DType::BF16 || cache.k.ne[0] != kHeadDim ||
+    if (cache.k.dtype != DType::BF16 || cache.v.dtype != DType::FP16 || cache.k.ne[0] != kHeadDim ||
         cache.k.ne[1] != padded || cache.k.ne[2] != kKVHeads || cache.v.ne[0] != kHeadDim ||
         cache.v.ne[1] != padded || cache.v.ne[2] != kKVHeads ||
         cache.v.ne[3] != cache.lane_capacity || cache.lane_capacity <= 0 ||

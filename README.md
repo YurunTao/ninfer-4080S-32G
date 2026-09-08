@@ -5,7 +5,9 @@ NInfer-4090 runs **Qwen3.8-27B** on one 24 GB NVIDIA GeForce RTX 4090. It is an 
 [Neroued/ninfer](https://github.com/Neroued/ninfer), a specialized C++20/CUDA inference engine.
 The engine loads the official groupwise `.ninfer` artifact, serves OpenAI- and
 Anthropic-compatible APIs, and supports paged KV, compatible-prefix reuse, CUDA Graphs, MTP
-speculative decoding, reasoning-effort control, and ReplaySSM state transactions.
+speculative decoding, reasoning-effort control, and ReplaySSM state transactions. The Qwen3.8-27B
+artifact additionally supports DFlash2 speculative decoding (`--spec dflash2 --draft-tokens 7`)
+when converted with DFlash2 companion weights; the 35B-A3B target keeps its text-only DFlash.
 
 This fork targets `sm_89` and Linux. Blackwell-only NVFP4/W4A4 execution is unavailable; the
 engine uses the same groupwise-int path as the 3090 base. The Windows path and the
@@ -386,6 +388,16 @@ JSONL request logs. See [HTTP serving](docs/serving.md) and [CLI usage](docs/cli
 - [jram4/ninfer-4090](https://github.com/jram4/ninfer-4090) - an earlier RTX 4090 port of a July
   2026 snapshot. Its Ada dispatch tuning targets a kernel organization that upstream has since
   replaced, so this fork starts from the current 3090 base instead.
+
+## Support
+
+NInfer is a personal project that I develop out of interest. If you find it useful and would like
+to support its continued development, you can [support the project on Ko-fi](https://ko-fi.com/neroued).
+
+Support is entirely voluntary. It is not a purchase or investment and does not come with financial
+returns, promised services or features, or a role in project decisions. The project's direction,
+priorities, technical choices, and release schedule remain independently determined by the
+maintainer.
 
 ## License
 

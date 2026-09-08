@@ -5,6 +5,7 @@
 // implementation details and never enter this benchmark's dispatch or output schema.
 
 #include "ninfer/ops/softmax_attention.h"
+#include "ninfer/ops/kv_cache_append.h"
 
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
@@ -12,6 +13,7 @@
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -71,9 +73,10 @@ struct Options {
     std::vector<std::int32_t> row_contexts;
     std::vector<std::int32_t> valid_columns;
     std::vector<std::int32_t> table_rows;
-    int warmup   = 5;
-    int repeat   = 30;
-    bool profile = false;
+    int graph_calls = 1;
+    int warmup      = 5;
+    int repeat      = 30;
+    bool profile    = false;
     std::string csv_out;
 };
 
@@ -93,8 +96,10 @@ struct Result {
     double logical_bytes;
     double qk_flops;
     double pv_flops;
-    double physical_kv_read_bytes;
+    double unique_kv_bytes;
     bench::ColdTiming timing;
+    std::size_t graph_nodes = 0, workspace_peak = 0;
+    int graph_calls = 1;
 };
 
 [[noreturn]] void usage(const char* message) {
@@ -108,7 +113,7 @@ struct Result {
                  "[--table-rows R0,...] "
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
                  "[--mapping identity|fragmented] "
-                 "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
+                 "[--warmup N] [--repeat N] [--graph-calls N] [--profile] [--csv-out PATH]\n",
                  message);
     std::exit(2);
 }
@@ -226,6 +231,9 @@ Options parse_options(int argc, char** argv) {
                 options.mapping = PageMapping::Fragmented;
             else
                 usage("--mapping expects identity or fragmented");
+        } else if (argument == "--graph-calls") {
+            options.graph_calls =
+                parse_i32(next("--graph-calls requires a value"), 1, 128, "--graph-calls");
         } else if (argument == "--warmup") {
             options.warmup = parse_i32(next("--warmup requires a value"), 0, 10000, "--warmup");
         } else if (argument == "--repeat") {
@@ -240,6 +248,9 @@ Options parse_options(int argc, char** argv) {
             usage("unknown argument");
         }
     }
+    if (options.graph_calls > 1 &&
+        (options.cache != CacheMode::Warm || options.execution != Execution::Graph))
+        usage("repeated graphs require --cache warm --execution graph");
     for (const std::int32_t tokens : options.tokens) {
         for (const std::int32_t context : options.contexts) {
             if (context > std::numeric_limits<std::int32_t>::max() - tokens) {
@@ -391,6 +402,28 @@ std::int32_t profile_visible(std::span<const std::int32_t> contexts,
     return visible;
 }
 
+__global__ void initialize_values(__nv_bfloat16* data, std::size_t count, unsigned seed,
+                                  float scale) {
+    const std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    unsigned value = static_cast<unsigned>(i) + seed;
+    value ^= value >> 16;
+    value *= 0x7feb352dU;
+    value ^= value >> 15;
+    value *= 0x846ca68bU;
+    value ^= value >> 16;
+    data[i] = __float2bfloat16_rn((float(value >> 8) * (2.f / 16777216.f) - 1.f) * scale);
+}
+
+DeviceBuffer varied_values(std::size_t count, unsigned seed, float scale) {
+    DeviceBuffer result(count * 2);
+    initialize_values<<<(count + 255) / 256, 256>>>(static_cast<__nv_bfloat16*>(result.p), count,
+                                                    seed, scale);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return result;
+}
+
 class Case {
 public:
     Case(Geometry geometry, DType dtype, std::int32_t tokens,
@@ -403,12 +436,13 @@ public:
           mapping_(mapping), logical_pages_(padded_ / kPagedKVPageSize),
           physical_pages_(mapping == PageMapping::Identity ? batch_ * logical_pages_
                                                            : 2 * batch_ * logical_pages_ + 1),
-          q_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * geometry.query_heads * tokens *
-                              batch_)),
-          k_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * tokens *
-                              batch_)),
-          v_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * tokens *
-                              batch_)),
+          q_(varied_values(static_cast<std::size_t>(kHeadDim) * geometry.query_heads * tokens *
+                               batch_,
+                           101, .25f)),
+          k_(varied_values(static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * tokens * batch_,
+                           103, .25f)),
+          v_(varied_values(static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * tokens * batch_,
+                           107, 1.f)),
           positions_(static_cast<std::size_t>(tokens) * batch_ * sizeof(std::int32_t)),
           valid_columns_(static_cast<std::size_t>(batch_) * sizeof(std::int32_t)),
           table_rows_(static_cast<std::size_t>(batch_) * sizeof(std::int32_t)),
@@ -467,6 +501,27 @@ public:
                               cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(table_rows_.p, table_rows.data(), table_rows_.bytes,
                               cudaMemcpyHostToDevice));
+        // Populate every represented cache row through the public codec, outside measurement.
+        // A row view selects its own table while all physical planes remain shared.
+        std::vector<std::int32_t> initial_positions(padded_);
+        for (int pos = 0; pos < padded_; ++pos) initial_positions[pos] = pos;
+        DeviceBuffer dp(std::size_t(padded_) * 4);
+        CUDA_CHECK(cudaMemcpy(dp.p, initial_positions.data(), dp.bytes, cudaMemcpyHostToDevice));
+        Tensor positions(dp.p, DType::I32, {padded_});
+        for (int row = 0; row < batch_; ++row) {
+            auto initial_k =
+                varied_values(std::size_t(kHeadDim) * geometry.kv_heads * padded_, 211 + row, .25f);
+            auto initial_v =
+                varied_values(std::size_t(kHeadDim) * geometry.kv_heads * padded_, 311 + row, 1.f);
+            Tensor k(initial_k.p, DType::BF16, {kHeadDim, geometry.kv_heads, padded_});
+            Tensor v(initial_v.p, DType::BF16, {kHeadDim, geometry.kv_heads, padded_});
+            auto row_cache = cache_view_;
+            row_cache.block_table =
+                Tensor(static_cast<std::int32_t*>(block_table_.p) + row * logical_pages_,
+                       DType::I32, {logical_pages_});
+            ops::kv_cache_append(k, v, positions, row_cache, nullptr);
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
     }
 
     void launch(Entry entry, cudaStream_t stream) {
@@ -484,6 +539,12 @@ public:
     }
 
     [[nodiscard]] std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
+
+    [[nodiscard]] std::size_t workspace_peak() const {
+        if (workspace_.used() != 0 || workspace_.peak_used() > workspace_bytes_)
+            throw std::runtime_error("attention workspace query mismatch");
+        return workspace_.peak_used();
+    }
 
 private:
     std::int32_t batch_;
@@ -672,7 +733,8 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
             output << ",,,";
         }
         output << ',' << result.timing.median_us << ',' << result.timing.min_us << ','
-               << result.timing.p95_us << '\n';
+               << result.timing.p95_us << ',' << result.graph_nodes << ',' << result.workspace_peak
+               << ',' << result.graph_calls << '\n';
     }
 }
 
@@ -686,8 +748,10 @@ void profile(Case& data, Entry entry, const Geometry& geometry, DType dtype, con
     if (execution == Execution::Graph) {
         data.launch(entry, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        graph.capture(stream,
-                      [&](cudaStream_t launch_stream) { data.launch(entry, launch_stream); });
+        graph.capture(stream, [&](cudaStream_t launch_stream) {
+            for (int call = 0; call < options.graph_calls; ++call)
+                data.launch(entry, launch_stream);
+        });
         for (int index = 0; index < options.warmup; ++index) { graph.launch(stream); }
     } else {
         for (int index = 0; index < options.warmup; ++index) { data.launch(entry, stream); }
@@ -703,7 +767,8 @@ void profile(Case& data, Entry entry, const Geometry& geometry, DType dtype, con
         entry_name(entry), geometry.name, dtype_name(dtype), mapping_name(options.mapping),
         execution_name(execution), cache_name(cache), batch, width,
         static_cast<int>(contexts.size()), contexts.data(), static_cast<int>(valid_columns.size()),
-        valid_columns.data(), static_cast<int>(table_rows.size()), table_rows.data());
+        valid_columns.data(), static_cast<int>(table_rows.size()), table_rows.data(),
+        options.graph_calls);
     std::fflush(stdout);
     CUDA_CHECK(cudaProfilerStart());
     if (execution == Execution::Graph)
@@ -821,7 +886,8 @@ int main(int argc, char** argv) {
                                     data.launch(entry, stream);
                                     CUDA_CHECK(cudaStreamSynchronize(stream));
                                     graph.capture(stream, [&](cudaStream_t launch_stream) {
-                                        data.launch(entry, launch_stream);
+                                        for (int call = 0; call < options.graph_calls; ++call)
+                                            data.launch(entry, launch_stream);
                                     });
                                 }
                                 for (const Execution execution :
@@ -863,6 +929,14 @@ int main(int argc, char** argv) {
                                                                    rows.valid_columns),
                                             measure(data, entry, execution, cache, &graph, flush,
                                                     stream, options.warmup, options.repeat)};
+                                        result.graph_nodes =
+                                            execution == Execution::Graph ? graph.nodes() : 0;
+                                        result.workspace_peak = data.workspace_peak();
+                                        result.graph_calls =
+                                            execution == Execution::Graph ? options.graph_calls : 1;
+                                        result.timing.median_us /= result.graph_calls;
+                                        result.timing.min_us /= result.graph_calls;
+                                        result.timing.p95_us /= result.graph_calls;
                                         report(result);
                                         results.push_back(result);
                                     }

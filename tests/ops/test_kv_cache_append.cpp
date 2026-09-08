@@ -9,6 +9,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -486,6 +489,20 @@ std::vector<std::uint16_t> patterned_bits(std::size_t count, std::uint32_t seed)
     return bits;
 }
 
+
+std::uint16_t bf16_bits_to_fp16_bits(std::uint16_t bits) {
+    __nv_bfloat16 source;
+    std::memcpy(&source, &bits, sizeof(bits));
+    const __half converted = __float2half_rn(__bfloat162float(source));
+    std::uint16_t out = 0;
+    std::memcpy(&out, &converted, sizeof(out));
+    return out;
+}
+
+void convert_ring_v_to_fp16(std::vector<std::uint16_t>& v) {
+    for (std::uint16_t& value : v) { value = bf16_bits_to_fp16_bits(value); }
+}
+
 void append_oracle(std::vector<std::uint16_t>& cache_k, std::vector<std::uint16_t>& cache_v,
                    const std::vector<std::uint16_t>& input_k,
                    const std::vector<std::uint16_t>& input_v,
@@ -523,7 +540,7 @@ CyclicKVCacheLayerView cyclic_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& 
                                    int lane_capacity = 1) {
     return {
         .k        = Tensor(k.data(), DType::BF16, {kHeadDim, kWindow, kKVHeads, lane_capacity}),
-        .v        = Tensor(v.data(), DType::BF16, {kHeadDim, kWindow, kKVHeads, lane_capacity}),
+        .v        = Tensor(v.data(), DType::FP16, {kHeadDim, kWindow, kKVHeads, lane_capacity}),
         .capacity = kWindow,
         .padded_capacity = kWindow,
         .num_kv_heads    = kKVHeads,
@@ -552,6 +569,7 @@ int run_case(int tokens, int commit_count, int first_position, bool cyclic,
     auto expected_k = initial_k;
     auto expected_v = initial_v;
     append_oracle(expected_k, expected_v, host_k, host_v, positions, commit_count, cyclic, mapping);
+    if (cyclic) { convert_ring_v_to_fp16(expected_v); }
 
     DeviceBuffer d_k         = to_device(host_k);
     DeviceBuffer d_v         = to_device(host_v);
@@ -562,7 +580,13 @@ int run_case(int tokens, int commit_count, int first_position, bool cyclic,
     GuardedDeviceBuffer cache_k(cache_count * sizeof(std::uint16_t));
     GuardedDeviceBuffer cache_v(cache_count * sizeof(std::uint16_t));
     cache_k.copy_from_host(initial_k.data(), cache_k.bytes());
-    cache_v.copy_from_host(initial_v.data(), cache_v.bytes());
+    if (cyclic) {
+        auto initial_v_ring = initial_v;
+        convert_ring_v_to_fp16(initial_v_ring);
+        cache_v.copy_from_host(initial_v_ring.data(), cache_v.bytes());
+    } else {
+        cache_v.copy_from_host(initial_v.data(), cache_v.bytes());
+    }
 
     Tensor k(d_k.p, DType::BF16, {kHeadDim, kKVHeads, tokens, 1});
     Tensor v(d_v.p, DType::BF16, {kHeadDim, kKVHeads, tokens, 1});
@@ -613,6 +637,8 @@ int cyclic_graph_replay_case() {
     const auto host_v             = patterned_bits(input_count, 0x55667788u);
     const auto initial_k          = patterned_bits(cache_count, 0x99aabbccu);
     const auto initial_v          = patterned_bits(cache_count, 0xddeeff01u);
+    auto initial_v_ring           = initial_v;
+    convert_ring_v_to_fp16(initial_v_ring);
     std::vector<std::int32_t> positions(tokens);
     for (int i = 0; i < tokens; ++i) positions[static_cast<std::size_t>(i)] = first_position + i;
 
@@ -645,7 +671,7 @@ int cyclic_graph_replay_case() {
     int failures = 0;
     for (const int commit_count : std::array{0, 7, tokens}) {
         cache_k.copy_from_host(initial_k.data(), cache_k.bytes());
-        cache_v.copy_from_host(initial_v.data(), cache_v.bytes());
+        cache_v.copy_from_host(initial_v_ring.data(), cache_v.bytes());
         d_count.copy_from_host(&commit_count, sizeof(commit_count));
         cuda_check(cudaGraphLaunch(executable, stream), "launch kv append graph");
         cuda_synchronize(stream);
@@ -653,6 +679,7 @@ int cyclic_graph_replay_case() {
         auto expected_k = initial_k;
         auto expected_v = initial_v;
         append_oracle(expected_k, expected_v, host_k, host_v, positions, commit_count, true, {});
+        convert_ring_v_to_fp16(expected_v);
         const std::string label =
             "kv_cache_append_prefix cyclic graph C=" + std::to_string(commit_count);
         failures +=
@@ -802,6 +829,7 @@ int batch_selector_case(bool cyclic) {
             }
         }
     }
+    if (cyclic) { convert_ring_v_to_fp16(expected_v); }
 
     DeviceBuffer d_k         = to_device(host_k);
     DeviceBuffer d_v         = to_device(host_v);
@@ -812,7 +840,13 @@ int batch_selector_case(bool cyclic) {
     GuardedDeviceBuffer cache_k(initial_k.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer cache_v(initial_v.size() * sizeof(std::uint16_t));
     cache_k.copy_from_host(initial_k.data(), cache_k.bytes());
-    cache_v.copy_from_host(initial_v.data(), cache_v.bytes());
+    if (cyclic) {
+        auto initial_v_ring = initial_v;
+        convert_ring_v_to_fp16(initial_v_ring);
+        cache_v.copy_from_host(initial_v_ring.data(), cache_v.bytes());
+    } else {
+        cache_v.copy_from_host(initial_v.data(), cache_v.bytes());
+    }
 
     Tensor k(d_k.p, DType::BF16, {kHeadDim, kKVHeads, tokens, batch});
     Tensor v(d_v.p, DType::BF16, {kHeadDim, kKVHeads, tokens, batch});

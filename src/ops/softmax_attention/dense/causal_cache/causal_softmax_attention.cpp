@@ -347,7 +347,12 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
                                                     std::int32_t batch_size,
                                                     CausalAttentionExecutionEnvelope envelope) {
     if (width >= 1 && width <= kSmallTChunkTokens) { return CausalAttentionRoute::SmallT; }
-    if (batch_size > 1) { return CausalAttentionRoute::ChunkedSmallT; }
+    // Speculative verify at batch one (DFlash2 W=K+1 up to 16; MTP W=K+1 up to 6) pays for the
+    // prompt kernel's large-CTA topology it never saturates. Two or three small_t chunk launches
+    // retire the same columns with far less fixed cost on this target.
+    if (batch_size > 1 || width <= 2 * kSmallTChunkTokens) {
+        return CausalAttentionRoute::ChunkedSmallT;
+    }
     const std::uint32_t prompt_visible_keys =
         width <= 2 * kSmallTChunkTokens ? kTwoChunkPromptVisibleKeys : kThreeChunkPromptVisibleKeys;
     if (q_heads == 16 && width <= kMaximumVerifyTokens &&

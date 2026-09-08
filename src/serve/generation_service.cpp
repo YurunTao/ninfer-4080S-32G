@@ -208,6 +208,10 @@ public:
         if (sink_->on_start) { sink_->on_start(start); }
     }
 
+    void progress(ninfer::PromptProgress) override {}
+
+    void timing(ninfer::GenerationTimingObservation) override {}
+
     void publish(ninfer::OutputDelta delta) override {
         if (delta.text.empty()) { return; }
         if (delta.channel == ninfer::OutputChannel::Reasoning) {
@@ -358,7 +362,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                                               consumer_mode == GenerationConsumerMode::Streaming
                                                   ? ninfer::OutputConsumerMode::Streaming
                                                   : ninfer::OutputConsumerMode::Aggregate,
-                                              prepared.lifetime->deadline);
+                                              {}, prepared.lifetime->deadline);
         prepared.sampling   = prepared.generation.resolved_sampling();
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
         throw_request_error(exception);

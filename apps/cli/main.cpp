@@ -129,6 +129,10 @@ class StreamingSink final : public ninfer::OutputSink {
 public:
     void start(ninfer::GenerationStart) override {}
 
+    void progress(ninfer::PromptProgress) override {}
+
+    void timing(ninfer::GenerationTimingObservation) override {}
+
     void publish(ninfer::OutputDelta delta) override {
         std::ostream& output =
             delta.channel == ninfer::OutputChannel::Reasoning ? std::cerr : std::cout;

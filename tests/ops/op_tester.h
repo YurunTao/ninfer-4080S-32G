@@ -235,7 +235,9 @@ inline int verify_exact(const char* label, const std::vector<T>& got,
     }
     for (std::size_t i = 0; i < got.size(); ++i) {
         if (!(got[i] == expected[i])) {
-            std::cerr << label << ": exact mismatch at index " << i << '\n';
+            std::cerr << label << ": exact mismatch at index " << i << " got="
+                      << +static_cast<std::uint64_t>(got[i]) << " expected="
+                      << +static_cast<std::uint64_t>(expected[i]) << '\n';
             return 1;
         }
     }

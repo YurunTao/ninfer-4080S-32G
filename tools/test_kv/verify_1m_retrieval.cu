@@ -58,7 +58,7 @@ int main(int argc, char** argv) {
 
     std::cout << "=================================================================\n";
     std::cout << "   NInfer: True E8 Conway-Sloane Lattice Microbenchmark\n";
-    std::cout << "   Target: NVIDIA GeForce RTX 4090 (sm_89, 24 GB VRAM)\n";
+    std::cout << "   Target: NVIDIA GeForce RTX 4080 SUPER (sm_89, 32 GB VRAM)\n";
     std::cout << "=================================================================\n\n";
 
     const int num_tiles = (num_tokens + ninfer::test_kv::kTokensPerTile - 1) / ninfer::test_kv::kTokensPerTile;

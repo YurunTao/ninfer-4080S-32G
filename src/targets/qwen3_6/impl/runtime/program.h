@@ -263,6 +263,8 @@ struct AdmissionCandidateImpl<NINFER_QWEN36_VARIANT> {
     // target can release Host replicas instead of being mistaken for a structurally invalid node.
     std::size_t blocked_host_allocation_bytes = 0;
     detail::PhysicalDemand demand;
+    // Resources released by consuming this private owner alone. Shared aliases are intentionally
+    // absent; complete pressure targets settle their joint reference graph separately.
     detail::PhysicalResources source_resources;
     NINFER_QWEN36_RUNTIME_NS::ReusePath reuse = NINFER_QWEN36_RUNTIME_NS::ReusePath::Root;
     std::uint32_t reuse_base                  = 0;
@@ -593,6 +595,7 @@ public:
     [[nodiscard]] runtime::ExecutionTiming
     append_forced_tokens(std::span<const SequenceHandle> sequences,
                          std::span<const TokenId> row_major_tokens, std::uint32_t row_stride,
+                         std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
                          runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] CommitResult commit(PendingBatch&& pending,
                                       std::span<const runtime::CommitDecision> decisions,
@@ -998,6 +1001,7 @@ private:
     [[nodiscard]] runtime::ExecutionTiming resolve_pending_raw(
         std::span<const std::uint32_t> lanes, std::span<const std::uint32_t> accepted_tokens,
         std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> cancelled,
+        std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
         runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] bool valid_sequence(SequenceHandle handle) const noexcept;
     [[nodiscard]] bool valid_continuation(const ContinuationHandle& handle) const noexcept;
@@ -1172,9 +1176,14 @@ private:
     void set_device_i32(Tensor& tensor, std::int32_t value);
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();
+    void
+    commit_generated_prefix_identity(SequenceState& sequence, std::uint32_t base_ledger_frontier,
+                                     std::span<const TokenId> accepted_tokens,
+                                     std::optional<std::uint32_t> prefix_execution_split_after);
     [[nodiscard]] runtime::ExecutionTiming
     resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
                                     std::uint32_t accepted_tokens, bool terminal,
+                                    std::optional<std::uint32_t> prefix_execution_split_after,
                                     runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::PrefillStepResult
     advance_prefill(SequenceState& sequence, RequestControl& request,
@@ -1200,7 +1209,7 @@ private:
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
-    void materialize_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
+    void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                  std::uint32_t backend_tokens = 0);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);
