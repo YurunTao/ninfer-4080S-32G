@@ -119,6 +119,11 @@ struct ContextCacheOptions {
     // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
     std::uint32_t host_state_slots     = kDefaultHostStateSlots;
     std::size_t host_kv_capacity_bytes = kDefaultHostKvCapacityBytes;
+    // Interior capture spacing in tokens: the request plan offers a private long anchor every
+    // this many tokens of a long prompt, so a mid-history edit can rewind to an interior point
+    // instead of the turn boundary. 0 disables periodic capture. Retention stays bounded by
+    // max_long_anchors_per_continuation.
+    std::uint32_t checkpoint_interval = 16384;
     // Bounded private/shared logical catalogs and per-continuation long-anchor count.
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;

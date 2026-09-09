@@ -284,6 +284,12 @@ identity。
 这样对话系统追加新的 user message 或改写生成尾部时，仍能复用稳定历史，而不会把可变 suffix 错当成
 prefix identity 的一部分。
 
+`LongAnchor` 的来源有两类：prompt cache marker 显式声明的恢复点，以及 request plan 按
+`context_cache.checkpoint_interval`（默认 16384 tokens，0 关闭）为长 prompt 周期性提供的内部恢复点。
+周期性提供只影响 candidate 集合：retention 仍由本节的容量、价值与降级规则决定，每个 continuation 最多
+保留 `max_long_anchors_per_continuation` 个，因此捕获成本不随 prompt 深度增长。周期 frontier 不得落在
+任何 Vision item 的 token span 内部，否则该 item 没有合法的重建分解。
+
 Checkpoint 发布后：
 
 - identity、frontier 和 required coverage 不变；

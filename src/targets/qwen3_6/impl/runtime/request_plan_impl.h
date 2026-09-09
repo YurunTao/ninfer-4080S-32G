@@ -4,6 +4,8 @@
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
+#include "runtime/contract/checkpoint_interval.h"
+
 #include <algorithm>
 #include <cmath>
 #include <iterator>
@@ -13,6 +15,21 @@
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
+
+// A capture frontier may not fall strictly inside a Vision item's token span: the item is
+// encoded as one unit, so a split there has no valid rebuild decomposition.
+bool capture_frontier_clear_of_vision(std::uint32_t frontier,
+                                      std::span<const qwen3_6::VisionItem> items) {
+    for (const qwen3_6::VisionItem& item : items) {
+        if (item.token_spans.empty()) { return false; }
+        const qwen3_6::TokenSpan& first = item.token_spans.front();
+        const qwen3_6::TokenSpan& last  = item.token_spans.back();
+        if (last.count > std::numeric_limits<std::size_t>::max() - last.begin) { return false; }
+        const std::size_t end = last.begin + last.count;
+        if (first.begin < frontier && frontier < end) { return false; }
+    }
+    return true;
+}
 
 void validate_sampling(const ResolvedSamplingParameters& sampling) {
     if (!std::isfinite(sampling.temperature) || !std::isfinite(sampling.top_p) ||
@@ -364,6 +381,15 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
                         opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix,
                         opportunity.kind == PromptCacheMarkerKind::PrivateLongAnchor,
                         opportunity.evidence);
+        }
+        // Interior periodic anchors: without them a long prompt can rewind only to its rewrite
+        // checkpoint, so an edit below that point re-prefills everything. The retention policy
+        // keeps at most max_long_anchors_per_continuation of these offers.
+        for (const std::uint32_t frontier : runtime::periodic_capture_frontiers(
+                 base->summary.prompt_tokens, context_cache.checkpoint_interval)) {
+            if (!capture_frontier_clear_of_vision(frontier, prompt.vision_items)) { continue; }
+            add_capture(frontier, frontier, std::nullopt, false, true,
+                        SharedCandidateEvidence::None);
         }
         std::sort(base->capture_groups.begin(), base->capture_groups.end(),
                   [](const CaptureGroup& left, const CaptureGroup& right) {

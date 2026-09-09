@@ -72,7 +72,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--turn-checkpoints N (retired)] [--log-stats-interval-ms N] "
-           "[--session-auto-restore] [--auto-save-on-stop] "
+           "[--session-auto-restore] [--auto-save-on-stop] [--checkpoint-interval N] "
            "[--max-snapshot-disk-gib N] "
            "[--device N] "
            "[--context-cost-presets FILE] "
@@ -109,6 +109,9 @@ std::string serve_usage_text(const char* argv0) {
            "       --auto-save-evicted spills an involuntarily evicted session back to the "
            "slot file it was last saved to or restored from, before the eviction destroys it "
            "(requires --slot-save-path; explicit erase never auto-saves)\n"
+           "       --checkpoint-interval offers an interior long anchor every N tokens of a "
+           "long prompt (default 16384, 0 disables); retention stays bounded by "
+           "--max-long-anchors-per-continuation\n"
            "       --session-auto-restore resumes the deepest stored session matching an "
            "incoming prompt before scheduling it, without any client session header "
            "(requires --slot-save-path; a miss falls back to a cold prefill)\n"
@@ -204,6 +207,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.deprecated_turn_checkpoints_given = true;
         } else if (arg == "--auto-save-evicted") {
             options.auto_save_evicted = true;
+        } else if (arg == "--checkpoint-interval") {
+            options.context_cache.checkpoint_interval = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--checkpoint-interval"),
+                                      "checkpoint-interval"));
         } else if (arg == "--session-auto-restore") {
             options.session_auto_restore = true;
         } else if (arg == "--auto-save-on-stop") {

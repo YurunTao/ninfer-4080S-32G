@@ -203,6 +203,9 @@ ninfer_add_test(ninfer_slot_files_test
 ninfer_add_test(ninfer_session_store_test
   SOURCES test_session_store.cpp
   LIBRARIES ninfer_core)
+ninfer_add_test(ninfer_checkpoint_interval_test
+  SOURCES test_checkpoint_interval.cpp
+  LIBRARIES ninfer_core)
 ninfer_add_test(ninfer_request_log_test
   SOURCES test_request_log.cpp
   LIBRARIES ninfer_serve)
