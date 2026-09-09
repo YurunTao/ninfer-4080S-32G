@@ -96,7 +96,7 @@ struct Result {
     double logical_bytes;
     double qk_flops;
     double pv_flops;
-    double unique_kv_bytes;
+    double physical_kv_read_bytes;
     bench::ColdTiming timing;
     std::size_t graph_nodes = 0, workspace_peak = 0;
     int graph_calls = 1;

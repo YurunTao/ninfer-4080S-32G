@@ -2,8 +2,8 @@
 
 #include "ninfer/engine.h"
 
-#include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 
 #include <exception>
 #include <filesystem>

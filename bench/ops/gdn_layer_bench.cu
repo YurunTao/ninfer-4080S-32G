@@ -30,6 +30,7 @@
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_plan.h"
 #include "ops/kernel/rmsnorm.cuh"
+#include "ops/launcher/device_sms.h"
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
 
 #include <cuda_runtime.h>
@@ -307,10 +308,11 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
     Tensor gated_out(resources.gated_out.p, DType::BF16, {kHeadDim, kValueHeads, tokens});
 
     const auto layer = [&](cudaStream_t s) {
+        const DeviceExecutionView execution{s, ops::detail::device_multiprocessor_count()};
         const bool fused_norm_control = options.norm_control == "fused";
         if (fused_norm_control) {
             ops::gdn_norm_gating_proj(residual, input_norm, kEps, resources.control_weight, a_log,
-                                      dt_bias, resources.workspace, hidden, g, beta, s);
+                                      dt_bias, resources.workspace, hidden, g, beta, execution);
         } else {
             ops::rmsnorm(residual, input_norm, kEps, true, hidden, s);
         }
@@ -328,7 +330,7 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
         }
         if (!fused_norm_control) {
             ops::gdn_gating_proj(hidden, resources.control_weight, a_log, dt_bias,
-                                 resources.workspace, g, beta, s);
+                                 resources.workspace, g, beta, execution);
         }
         Tensor q_recurrent       = q.view({kHeadDim, kQkHeads, tokens});
         Tensor k_recurrent       = k.view({kHeadDim, kQkHeads, tokens});
@@ -348,7 +350,8 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
             const std::int64_t rows      = static_cast<std::int64_t>(kValueHeads) * tokens;
             const auto grid =
                 static_cast<unsigned int>((rows + rows_per_block - 1) / rows_per_block);
-            ops::rmsnorm_warp_bf16x2_kernel<ops::RmsEpilogue::Gated, block><<<grid, block, 0, s>>>(
+            ops::rmsnorm_warp_bf16x2_kernel<ops::RmsEpilogue::Gated, block, false>
+                <<<grid, block, 0, s>>>(
                 static_cast<const __nv_bfloat162*>(recurrent_out.data),
                 static_cast<const __nv_bfloat162*>(gdn_norm.data),
                 static_cast<const __nv_bfloat162*>(z.data),
