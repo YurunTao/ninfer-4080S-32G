@@ -82,6 +82,21 @@ DFlash2 的接受率随输出可预测性变化：结构化代码约 **72.7 %**�
 大幅领先（本机基准 156.7 vs 无投机 37.2 tok/s）。KV 精度/容量不影响解码时间，这是
 INT8 与 E8 档位在本卡上解码侧表现一致的原因。
 
+### 会话持久化与自治恢复（本卡实测）
+
+在约 12500 token 的代码文档会话上实测（245760 上下文、INT8 KV、DFlash2 K=7；前两行
+`thinking` 开，后四行 `thinking` 关）：
+
+| 场景 | 结果 |
+|---|---|
+| 冷算 | prefill 12527 tok，ttft 10.5 s |
+| 同进程续写（常驻复用） | 复用 12522 tok，ttft **271 ms** |
+| 驱逐落盘 | 写-once 快照 + 侧车（`snap_<ts>_<seq>.slot` / `.slot.meta`），`slot auto-save` 日志 |
+| 正常关停刷盘 | `session flush on stop n_saved=8` |
+| 重启后按 ledger digest 自治恢复（DFlash2 端点续写） | 复用 **12489 / 12509** tok，ttft **148 ms**（冷算 10.4 s），贪心输出逐 token 一致 |
+| 重启后命中内部检查点（MTP，尾部改标点） | 复用 **12481** tok，ttft **约 64 ms**，3/3 复现 |
+| 负控制：不同 prompt | 未命中，冷算（无误命中） |
+
 ## 本分支做了什么（汇总）
 
 基线：4090 fork（[sergiuszm/ninfer-4090](https://github.com/sergiuszm/ninfer-4090)，
@@ -113,6 +128,18 @@ INT8 与 E8 档位在本卡上解码侧表现一致的原因。
   `W8SmallTMmaSchedule` 候选（绕过路由表），冷缓存计时 Qwen3.8-27B gate/up 投影，
   一次跑完 T=4/8/16 的 warp/min-block/scale/staging 全空间。实测 T=8 宽度下 90 个
   变体全部落在 540 GB/s 的 1 % 之内——kernel 受权重访问模式限制而非受分块限制。
+
+- **磁盘会话存储与自治恢复**（`460f7c40` + `8a1c822e`）。每个写-once 快照都配一份
+  文本侧车（`<snapshot>.meta`），记录存储前沿 N、会话摘要与每个可恢复检查点；启动时**只读
+  侧车**重建索引，不碰快照载荷。`--session-auto-restore` 让请求在调度前按 ledger 前缀摘要
+  找回最深匹配的已存会话并物化到最空闲的 lane，**不需要客户端传任何 session header**；未命中、
+  无空闲 lane、文件损坏等一律回退冷算，绝不会让本来能成功的请求失败。驱逐的会话以
+  write-once 快照落盘（`snap_<ts>_<seq>.slot`），`--max-snapshot-disk-gib` 限制目录
+  （默认 20 GiB，LRU 先删），`--auto-save-on-stop` 在正常关停时刷盘。
+- **长 prompt 内部检查点**（`2ff8fd72`）。`--checkpoint-interval`（默认 16384 token，0 关闭）
+  让 request plan 为长 prompt 周期性提供 `LongAnchor` 候选，于是"改写 prompt 中段"不再只能
+  回退到本轮起点。候选只扩大集合，保留数量仍受 `--max-long-anchors-per-continuation`
+  约束；落在视觉 token 跨度内的前沿会被跳过。
 
 从 4090 fork 继承（本分支原样携带）：`sm_89` retarget 与 INT8 注意力 prefill 的 Ada
 重调、causal-tile 分区 key-block 遍历、`/v1/models` 的 `context_window` 字段、
@@ -157,9 +184,16 @@ DFlash2 工件由本仓库 `tools/reference` 的 Python 转换器生成（需要
 ./build-sm89/apps/ninfer-serve out/et27b_dflash2.ninfer \
   --host 127.0.0.1 --port 8080 \
   --max-context 262144 --kv-capacity 262144 --kv-dtype int8 \
-  --spec dflash2 --draft-tokens 7 \
-  --max-concurrency 4 --vision
+  --spec dflash2 --draft-tokens 7 --lm-head-draft \
+  --preserve-thinking --max-concurrency 4 --vision \
+  --slot-save-path /opt/ai/snapshots \
+  --session-auto-restore --auto-save-on-stop \
+  --max-snapshot-disk-gib 20 --checkpoint-interval 16384
 ```
+
+`--slot-save-path` 一旦设置，该目录即成为磁盘会话存储：启动时索引既有侧车，驱逐的会话落盘为
+write-once 快照。`--session-auto-restore` 是"重启后自动接续上次会话"的开关；MTP 档位下还能
+命中内部检查点做中段回退，DFlash2 档位下只能端点续写（见"已知限制"）。
 
 API 位于 `http://127.0.0.1:8080/v1`。CLI 单请求：
 
@@ -189,6 +223,11 @@ KV + 状态池，剩余约 1.65 GiB；官方工件 16.95 GiB 权重，剩余约 
   解码）是已知的开放优化点。
 - `--lm-head-draft` 与草稿自带提案头的优劣随语料反转：代码语料下后者更高
   （175.6 vs 160.5 tok/s），叙事类下结论相反。按工作负载选择。
+- **DFlash/DFlash2 档位下已存会话只能端点续写，不能中段回退**：这两个后端的本地草稿缓存
+  只镜像常驻端点，快照也不携带该缓存的前沿，因此侧车只发布端点检查点，恢复时也会丢弃快照
+  里的 rewrite/long-anchor 条目。想用内部检查点做中段回退，请用 `--spec mtp`（或不启用投机）。
+- 会话存储按快照字节计费（本机一个 12500 token 会话约 780 MiB），默认 20 GiB 上限、LRU 裁剪；
+  `--max-snapshot-disk-gib 0` 关闭上限前请确认磁盘容量。
 - 35B-A3B 目标与 Windows 路径从上游继承，但未在本卡测量；本分支的全部实测都是
   27B 目标。
 - 继承的引擎限制同样适用：单进程、单 GPU、单模型、有界 FIFO 准入、无主动请求
