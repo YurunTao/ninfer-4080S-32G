@@ -492,8 +492,13 @@ int main() {
     const DeviceExecutionView execution{nullptr, device.multiprocessor_count()};
     const DeviceExecutionView norm_execution{device.stream, device.multiprocessor_count()};
     int failures = 0;
-    failures += verify_workspace_capacity_contract(kQwen27, {1, 8, 1024, 2048, 4096, 4097});
-    failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 1024, 2048, 4096, 4097});
+    // Endpoints sample every route boundary of the current 80-SM table: the interval capacity
+    // must equal the largest single-width capacity at a boundary, so a stale list hides a route
+    // change instead of failing on it.
+    failures +=
+        verify_workspace_capacity_contract(kQwen27, {1, 2, 8, 9, 768, 769, 1664, 1665, 4097});
+    failures += verify_workspace_capacity_contract(
+        kQwen35, {1, 127, 128, 960, 961, 1920, 1921, 3840, 3841, 4097});
 
     // Every registered 27B projection route, including predicated and full token tiles.
     for (const std::int32_t tokens : {1, 8, 9, 1024, 1025, 2049, 4097}) {
