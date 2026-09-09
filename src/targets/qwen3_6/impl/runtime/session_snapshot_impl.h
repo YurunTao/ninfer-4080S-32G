@@ -951,7 +951,13 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
             if (index == endpoint_image) { return sequence.state.read; }
             return extra_images[static_cast<std::size_t>(index)];
         };
-        if (rewrite_valid_flag != 0) {
+        // A masked-draft backend (DFlash, DFlash2) cannot rebuild an interior checkpoint after a
+        // restore: its local draft cache mirrors only the resident endpoint, and the snapshot
+        // does not carry that cache's frontier. Adopting the rewrite/long-anchor entries would
+        // make the first reuse plan select a checkpoint it cannot materialize and fail the
+        // request, so the restored session keeps its endpoint and continues by exact extension.
+        const bool interior_restorable = !is_masked_draft_backend(speculative_backend);
+        if (interior_restorable && rewrite_valid_flag != 0) {
             if (const std::optional<StateImageHandle> handle = resolve_image(rewrite_image)) {
                 sequence.rewrite_state      = *handle;
                 sequence.rewrite_checkpoint = RewriteCheckpoint{
@@ -963,17 +969,19 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
                 state_store->retain_checkpoint_reference(*handle);
             }
         }
-        for (const SnapshotAnchor& anchor : anchors) {
-            if (anchor.ordinal > anchor_capacity) { continue; }
-            const std::optional<StateImageHandle> handle = resolve_image(anchor.image);
-            if (!handle) { continue; }
-            sequence.long_anchors.push_back(LongAnchorCheckpoint{
-                .state        = *handle,
-                .frontier     = anchor.frontier,
-                .ordinal      = anchor.ordinal,
-                .rebuild_work = anchor.rebuild_work,
-            });
-            state_store->retain_checkpoint_reference(*handle);
+        if (interior_restorable) {
+            for (const SnapshotAnchor& anchor : anchors) {
+                if (anchor.ordinal > anchor_capacity) { continue; }
+                const std::optional<StateImageHandle> handle = resolve_image(anchor.image);
+                if (!handle) { continue; }
+                sequence.long_anchors.push_back(LongAnchorCheckpoint{
+                    .state        = *handle,
+                    .frontier     = anchor.frontier,
+                    .ordinal      = anchor.ordinal,
+                    .rebuild_work = anchor.rebuild_work,
+                });
+                state_store->retain_checkpoint_reference(*handle);
+            }
         }
         refresh_state_views(sequence);
 

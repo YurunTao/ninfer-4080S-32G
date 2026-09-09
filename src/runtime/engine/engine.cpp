@@ -31,6 +31,20 @@
 namespace ninfer {
 namespace {
 
+std::string_view speculative_backend_name(SpeculativeBackend backend) noexcept {
+    switch (backend) {
+    case SpeculativeBackend::None:
+        return "none";
+    case SpeculativeBackend::Mtp:
+        return "mtp";
+    case SpeculativeBackend::DFlash:
+        return "dflash";
+    case SpeculativeBackend::DFlash2:
+        return "dflash2";
+    }
+    return "unknown";
+}
+
 EngineOptions normalize_engine_options(EngineOptions options) {
     switch (options.purpose) {
     case EnginePurpose::Generation:
@@ -340,8 +354,9 @@ public:
                          const targets::qwen3_6::RetainedSessionSnapshot& snapshot) {
         if (!sessions) { return; }
         runtime::SessionRecord record;
-        record.path              = path;
-        record.model_binding     = slot_model_binding(load);
+        record.path                = path;
+        record.speculative_backend = speculative_backend_name(options.speculative.backend);
+        record.model_binding       = slot_model_binding(load);
         record.snapshot_frontier = snapshot.tokens;
         record.session_digest    = snapshot.session_digest;
         record.bytes             = snapshot.bytes.size();

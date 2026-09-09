@@ -46,8 +46,9 @@ SessionRecord make_record(const std::filesystem::path& directory, std::string na
                           std::uint32_t generation,
                           std::vector<SessionCheckpointMeta> checkpoints) {
     SessionRecord record;
-    record.path              = (directory / name).string();
-    record.model_binding     = std::move(binding);
+    record.path                = (directory / name).string();
+    record.speculative_backend = "mtp";
+    record.model_binding       = std::move(binding);
     record.snapshot_frontier = frontier;
     record.session_digest    = ledger_prefix_digest(tokens(frontier));
     record.checkpoints       = std::move(checkpoints);
@@ -91,6 +92,7 @@ int main() {
         failures += check(parsed.has_value(), "sidecar did not round-trip");
         if (parsed) {
             failures += check(parsed->path == record.path, "round-trip path");
+            failures += check(parsed->speculative_backend == "mtp", "round-trip backend");
             failures += check(parsed->model_binding == record.model_binding, "round-trip binding");
             failures += check(parsed->snapshot_frontier == 64, "round-trip frontier");
             failures += check(parsed->session_digest == record.session_digest, "round-trip digest");
@@ -139,6 +141,47 @@ int main() {
                               "session_digest=00\nunknown_key=value\n")
                               .has_value(),
                           "unknown key rejected");
+    }
+
+    // A masked-draft backend cannot rewind to an interior checkpoint, so such a record must
+    // publish only its endpoint - through record() and through a rebuild from the sidecar.
+    {
+        const std::filesystem::path directory = root / "dflash";
+        SessionStore store(directory);
+        SessionRecord record =
+            make_record(directory, "dflash2.slot", "model-a", 64, 100, 10, 1,
+                        {SessionCheckpointMeta{32, ledger_prefix_digest(tokens(32))},
+                         SessionCheckpointMeta{64, ledger_prefix_digest(tokens(64))}});
+        record.speculative_backend = "dflash2";
+        write_file(record.path, "payload");
+        store.record(record);
+        // The interior 32-token frontier must be gone: a 40-token prompt would otherwise pick it.
+        failures += check(!store.lookup(tokens(40), "model-a").has_value(),
+                          "a dflash2 record exposed an interior checkpoint");
+        auto endpoint = store.lookup(tokens(64), "model-a");
+        failures += check(endpoint.has_value() && endpoint->frontier == 64,
+                          "a dflash2 endpoint did not match its own frontier");
+        // An extension of the stored ledger matches the endpoint.
+        std::vector<TokenId> extended = tokens(64);
+        extended.push_back(99);
+        auto extended_hit = store.lookup(extended, "model-a");
+        failures += check(extended_hit.has_value() && extended_hit->frontier == 64,
+                          "a dflash2 endpoint did not match an extending prompt");
+        // A legacy sidecar without the backend field is treated as non-rewindable too.
+        SessionStore legacy(directory);
+        SessionRecord legacy_record =
+            make_record(directory, "legacy.slot", "model-a", 64, 100, 11, 1,
+                        {SessionCheckpointMeta{32, ledger_prefix_digest(tokens(32))},
+                         SessionCheckpointMeta{64, ledger_prefix_digest(tokens(64))}});
+        legacy_record.speculative_backend.clear();
+        write_file(legacy_record.path, "payload");
+        legacy.record(legacy_record);
+        const std::size_t indexed_legacy = legacy.rebuild();
+        failures += check(indexed_legacy == 2, "legacy rebuild indexed the wrong count");
+        failures += check(!legacy.lookup(tokens(40), "model-a").has_value(),
+                          "a legacy record exposed an interior checkpoint");
+        failures += check(legacy.lookup(tokens(64), "model-a").has_value(),
+                          "a legacy record dropped its endpoint");
     }
 
     // Write-once paths are unique and carry the snapshot suffix.

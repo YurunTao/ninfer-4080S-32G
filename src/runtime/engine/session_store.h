@@ -54,8 +54,18 @@ struct SessionCheckpointMeta {
                                          const SessionCheckpointMeta&) noexcept = default;
 };
 
+// Snapshot sidecars record which speculative backend produced the image. A masked-draft
+// backend (DFlash, DFlash2) mirrors only the resident checkpoint in its local cyclic cache, so a
+// restored session can continue from its endpoint but cannot rewind to an interior checkpoint.
+// Only backends listed here publish interior frontiers to the index; an unknown or legacy value
+// is treated as non-rewindable.
+[[nodiscard]] inline bool session_backend_allows_checkpoint_rewind(std::string_view backend) {
+    return backend == "none" || backend == "mtp";
+}
+
 struct SessionRecord {
     std::string path;                    // snapshot file (write-once)
+    std::string speculative_backend;     // none | mtp | dflash | dflash2
     std::string model_binding;
     std::uint32_t snapshot_frontier = 0; // N: depth of the stored session
     std::string session_digest;          // digest(ledger[0:N])
@@ -128,6 +138,8 @@ inline std::string unescape_sidecar_value(std::string_view value) {
     out << "meta_version=" << kSessionSidecarVersion << '\n';
     out << "snapshot_path=" << detail::escape_sidecar_value(record.path) << '\n';
     out << "model_binding=" << detail::escape_sidecar_value(record.model_binding) << '\n';
+    out << "speculative_backend=" << detail::escape_sidecar_value(record.speculative_backend)
+        << '\n';
     out << "snapshot_frontier=" << record.snapshot_frontier << '\n';
     out << "session_digest=" << record.session_digest << '\n';
     out << "snapshot_bytes=" << record.bytes << '\n';
@@ -165,6 +177,8 @@ parse_session_sidecar(std::string_view content) {
             } else if (key == "snapshot_path") {
                 record.path = detail::unescape_sidecar_value(value);
                 has_path    = true;
+            } else if (key == "speculative_backend") {
+                record.speculative_backend = detail::unescape_sidecar_value(value);
             } else if (key == "model_binding") {
                 record.model_binding = detail::unescape_sidecar_value(value);
                 has_binding          = true;
@@ -224,6 +238,16 @@ parse_session_sidecar(std::string_view content) {
     if (!endpoint_recorded) {
         record.checkpoints.push_back(
             SessionCheckpointMeta{record.snapshot_frontier, record.session_digest});
+    }
+    if (!session_backend_allows_checkpoint_rewind(record.speculative_backend)) {
+        // Keep only the endpoint: an interior frontier of such a snapshot is not materializable,
+        // and publishing it would let a lookup pick a session it cannot resume.
+        record.checkpoints.erase(
+            std::remove_if(record.checkpoints.begin(), record.checkpoints.end(),
+                           [&](const SessionCheckpointMeta& checkpoint) {
+                               return checkpoint.frontier != record.snapshot_frontier;
+                           }),
+            record.checkpoints.end());
     }
     if (record.created_ms == 0) { record.created_ms = record.accessed_ms; }
     if (record.accessed_ms == 0) { record.accessed_ms = record.created_ms; }
@@ -313,6 +337,18 @@ public:
         if (record.path.empty() || record.snapshot_frontier == 0 ||
             record.session_digest.empty()) {
             return;
+        }
+        if (!session_backend_allows_checkpoint_rewind(record.speculative_backend)) {
+            record.checkpoints.erase(
+                std::remove_if(record.checkpoints.begin(), record.checkpoints.end(),
+                               [&](const SessionCheckpointMeta& checkpoint) {
+                                   return checkpoint.frontier != record.snapshot_frontier;
+                               }),
+                record.checkpoints.end());
+            if (record.checkpoints.empty()) {
+                record.checkpoints.push_back(
+                    SessionCheckpointMeta{record.snapshot_frontier, record.session_digest});
+            }
         }
         if (record.created_ms == 0) { record.created_ms = detail::session_now_ms(); }
         if (record.accessed_ms == 0) { record.accessed_ms = record.created_ms; }
