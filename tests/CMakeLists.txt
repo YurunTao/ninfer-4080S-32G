@@ -200,6 +200,9 @@ ninfer_add_test(ninfer_serve_options_test
 ninfer_add_test(ninfer_slot_files_test
   SOURCES test_slot_files.cpp
   LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_session_store_test
+  SOURCES test_session_store.cpp
+  LIBRARIES ninfer_core)
 ninfer_add_test(ninfer_request_log_test
   SOURCES test_request_log.cpp
   LIBRARIES ninfer_serve)

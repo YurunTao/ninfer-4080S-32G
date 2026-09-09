@@ -169,6 +169,7 @@ int main(int argc, char** argv) {
 
         const bool ok = server.listen();
         g_server.store(nullptr);
+        if (options.auto_save_on_stop) { (void)service.flush_sessions(); }
         if (!ok) {
             ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Error,
                                              "failed to bind " + options.host + ':' +

@@ -39,6 +39,13 @@ struct ServeOptions {
     std::uint32_t turn_checkpoint_ring     = 0;
     bool deprecated_turn_checkpoints_given = false; // --turn-checkpoints was passed and ignored
     bool auto_save_evicted                 = false; // spill evicted sessions to their slot file
+    // On-disk session store. Enabled by --slot-save-path: write-once snapshots plus sidecars in
+    // that directory are indexed at startup, so a restarted server can resume them.
+    // --max-snapshot-disk-gib; 0 = unlimited. The default bounds an otherwise unbounded
+    // write-once snapshot directory.
+    std::uint64_t session_store_bytes = 20ULL << 30;
+    bool session_auto_restore         = false;     // --session-auto-restore
+    bool auto_save_on_stop            = false;     // --auto-save-on-stop
     std::filesystem::path context_cost_presets;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;

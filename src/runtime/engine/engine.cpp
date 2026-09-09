@@ -6,6 +6,7 @@
 #include "runtime/contract/types.h"
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
+#include "runtime/engine/session_store.h"
 #include "targets/registry.h"
 
 #include <algorithm>
@@ -49,6 +50,14 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
+    }
+    if (options.session_auto_restore && options.session_store_dir.empty()) {
+        throw std::invalid_argument("session auto-restore requires a session store directory");
+    }
+    if (options.session_auto_restore && !options.context_cache.enabled) {
+        // A restored continuation could never be reused without the cache, so the restore would
+        // only burn a cold prefill's worth of state copies.
+        throw std::invalid_argument("session auto-restore requires the context cache");
     }
 
     ContextCacheOptions& cache      = options.context_cache;
@@ -260,7 +269,15 @@ public:
                 }
             },
             active);
-        if (options.auto_save_evicted) {
+        if (!options.session_store_dir.empty()) {
+            sessions = std::make_unique<runtime::SessionStore>(options.session_store_dir,
+                                                               options.session_store_bytes);
+            session_index_size = sessions->rebuild();
+        }
+        if (options.auto_save_evicted || sessions != nullptr) {
+            // With a store, every evicted session is spilled (write-once path + sidecar); without
+            // one, only sessions bound to a client-named slot file are.
+            const bool spill_unbound = sessions != nullptr;
             std::visit(
                 [&](auto& constructed_core) {
                     if constexpr (requires {
@@ -268,14 +285,17 @@ public:
                                           std::string(),
                                           std::function<void(
                                               std::string,
-                                              targets::qwen3_6::RetainedSessionSnapshot&&)>());
+                                              targets::qwen3_6::RetainedSessionSnapshot&&)>(),
+                                          false);
                                   }) {
                         constructed_core->set_eviction_sink(
                             slot_model_binding(load),
                             [this](std::string path,
                                    targets::qwen3_6::RetainedSessionSnapshot&& snapshot) {
+                                if (sessions) { path = sessions->allocate_snapshot_path().string(); }
                                 enqueue_write(std::move(path), std::move(snapshot));
-                            });
+                            },
+                            spill_unbound);
                     }
                 },
                 core);
@@ -314,12 +334,85 @@ public:
         writer_cv.wait(lock, [this] { return pending_writes.empty() && !write_in_flight; });
     }
 
+    // Index one written snapshot: the sidecar carries the identity facts a restarted server
+    // needs, so no payload has to be read back to make the session resumable.
+    void publish_sidecar(const std::string& path,
+                         const targets::qwen3_6::RetainedSessionSnapshot& snapshot) {
+        if (!sessions) { return; }
+        runtime::SessionRecord record;
+        record.path              = path;
+        record.model_binding     = slot_model_binding(load);
+        record.snapshot_frontier = snapshot.tokens;
+        record.session_digest    = snapshot.session_digest;
+        record.bytes             = snapshot.bytes.size();
+        record.checkpoints.reserve(snapshot.checkpoints.size());
+        for (const SlotCheckpoint& checkpoint : snapshot.checkpoints) {
+            record.checkpoints.push_back(
+                runtime::SessionCheckpointMeta{checkpoint.frontier, checkpoint.session_digest});
+        }
+        sessions->record(std::move(record));
+    }
+
+    // Autonomous resume: when a stored session covers a prefix of this prompt and no live lane
+    // already holds that history, materialize the snapshot before scheduling. Best effort - a
+    // miss, a full lane set, or an unreadable file all fall through to the cold path.
+    void restore_matching_session(const targets::qwen3_6::PreparedPrompt& prepared) {
+        if (!sessions || !options.session_auto_restore) { return; }
+        const std::span<const TokenId> prompt_tokens =
+            targets::qwen3_6::PreparedPromptAccess::view(prepared).token_ids;
+        if (prompt_tokens.empty()) { return; }
+        const std::string binding = slot_model_binding(load);
+        const std::optional<runtime::SessionMatch> match = sessions->lookup(prompt_tokens, binding);
+        if (!match) { return; }
+        std::vector<std::uint8_t> bytes;
+        try {
+            bytes = read_snapshot_file(match->record.path);
+        } catch (...) {
+            // A snapshot that vanished or cannot be read is dropped from the index; the next
+            // rebuild would do the same.
+            sessions->erase(match->record.path);
+            return;
+        }
+        std::visit(
+            [&](auto& core_ptr) {
+                if constexpr (requires {
+                                  core_ptr->restore_session_best_effort(
+                                      std::span<const std::uint8_t>(), std::string_view(),
+                                      std::string_view(), std::uint32_t(), std::string_view());
+                              }) {
+                    (void)core_ptr->restore_session_best_effort(
+                        std::span<const std::uint8_t>(bytes.data(), bytes.size()), binding,
+                        match->record.path, match->frontier,
+                        match->record.checkpoint_at_or_below(match->frontier)->digest);
+                }
+            },
+            core);
+    }
+
+    // Flush every retained session into the store. The writer thread publishes the files; the
+    // caller waits so a shutdown knows they landed.
+    std::size_t save_all_sessions() {
+        std::size_t saved = 0;
+        std::visit(
+            [&](auto& core_ptr) {
+                if constexpr (requires { core_ptr->save_all_catalogued_sessions(); }) {
+                    saved = core_ptr->save_all_catalogued_sessions();
+                }
+            },
+            core);
+        if (saved != 0) { drain_writes(); }
+        return saved;
+    }
+
     EngineOptions options;
     DeviceContext device;
     targets::ActiveTarget active;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
     Core core;
+    // On-disk session store; null when session_store_dir is empty.
+    std::unique_ptr<runtime::SessionStore> sessions;
+    std::size_t session_index_size = 0;
 
     std::mutex writer_mutex;
     std::condition_variable writer_cv;
@@ -340,12 +433,15 @@ private:
             lock.unlock();
 
             SlotAutoSaveEvent event;
-            event.path         = item.path;
-            event.tokens       = item.snapshot.tokens;
-            event.bytes        = item.snapshot.bytes.size();
+            event.path           = item.path;
+            event.tokens         = item.snapshot.tokens;
+            event.bytes          = item.snapshot.bytes.size();
+            event.session_digest = item.snapshot.session_digest;
+            event.checkpoints    = item.snapshot.checkpoints;
             const auto started = std::chrono::steady_clock::now();
             try {
                 write_snapshot_file(item.path, item.snapshot.bytes);
+                if (sessions) { publish_sidecar(item.path, item.snapshot); }
             } catch (const std::exception& error) {
                 event.error = error.what();
             } catch (...) {
@@ -381,6 +477,7 @@ private:
 public:
     static void write_snapshot_file(const std::string& path,
                                     const std::vector<std::uint8_t>& bytes);
+    static std::vector<std::uint8_t> read_snapshot_file(const std::string& path);
 };
 
 Engine::Engine(EngineOptions options) : impl_(std::make_shared<Impl>(std::move(options))) {}
@@ -553,6 +650,10 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             impl_, std::move(immediate), resolved_sampling));
     }
 
+    // Resume a stored session before scheduling, so the request arrives at a lane that already
+    // holds its history. Runs outside the execution mutex and is best effort by construction.
+    impl_->restore_matching_session(prompt.impl_->value);
+
     return std::visit(
         [&](auto& core) -> GenerationHandle {
             using CoreState = std::remove_cvref_t<decltype(core)>;
@@ -669,6 +770,20 @@ void Engine::Impl::write_snapshot_file(const std::string& path,
     }
 }
 
+std::vector<std::uint8_t> Engine::Impl::read_snapshot_file(const std::string& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        throw std::invalid_argument("session snapshot file is unavailable");
+    }
+    const std::streamsize size = file.tellg();
+    if (size <= 0) { throw std::invalid_argument("session snapshot file is empty"); }
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+    file.seekg(0);
+    file.read(reinterpret_cast<char*>(bytes.data()), size);
+    if (!file.good()) { throw std::invalid_argument("failed to read session snapshot file"); }
+    return bytes;
+}
+
 SlotSaveResult Engine::save_slot(std::uint32_t lane, const std::string& path,
                                  const std::string& expected_digest) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
@@ -688,11 +803,13 @@ SlotSaveResult Engine::save_slot(std::uint32_t lane, const std::string& path,
         impl_->core);
 
     Impl::write_snapshot_file(path, snapshot.bytes);
+    impl_->publish_sidecar(path, snapshot);
 
     SlotSaveResult result;
     result.tokens         = snapshot.tokens;
     result.bytes          = snapshot.bytes.size();
     result.session_digest = std::move(snapshot.session_digest);
+    result.checkpoints    = std::move(snapshot.checkpoints);
     result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     return result;
 }
@@ -703,17 +820,7 @@ SlotRestoreResult Engine::restore_slot(std::uint32_t lane, const std::string& pa
     // A restore must read the newest state, including a spill still in the writer queue.
     impl_->drain_writes();
 
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
-        throw std::invalid_argument("session snapshot file is unavailable");
-    }
-    const std::streamsize size = file.tellg();
-    if (size <= 0) { throw std::invalid_argument("session snapshot file is empty"); }
-    std::vector<std::uint8_t> snapshot(static_cast<std::size_t>(size));
-    file.seekg(0);
-    file.read(reinterpret_cast<char*>(snapshot.data()), size);
-    if (!file.good()) { throw std::invalid_argument("failed to read session snapshot file"); }
-    file.close();
+    std::vector<std::uint8_t> snapshot = Impl::read_snapshot_file(path);
 
     const std::string binding = slot_model_binding(impl_->load);
     auto restored = std::visit(
@@ -748,9 +855,18 @@ std::uint32_t Engine::erase_slot(std::uint32_t lane, const std::string& expected
         impl_->core);
 }
 
-std::vector<SlotState> Engine::slot_states() const {
+std::size_t Engine::save_all_sessions() {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
+    return impl_->save_all_sessions();
+}
+
+std::size_t Engine::session_index_size() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->session_index_size;
+}
+
+std::vector<SlotState> Engine::slot_states() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }    return std::visit(
         [](const auto& core) -> std::vector<SlotState> {
             if constexpr (requires { core->slot_states(); }) {
                 return core->slot_states();

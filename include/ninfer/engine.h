@@ -133,6 +133,13 @@ public:
     // Truthful per-slot occupancy, read from the snapshot published at every unit boundary.
     [[nodiscard]] std::vector<SlotState> slot_states() const;
 
+    // On-disk session store (EngineOptions::session_store_dir). session_index_size() reports how
+    // many stored snapshots the startup rebuild indexed. save_all_sessions() snapshots every
+    // retained session through the store and waits for the files to land; it is the shutdown
+    // flush and is a no-op when no store is configured.
+    [[nodiscard]] std::size_t session_index_size() const;
+    std::size_t save_all_sessions();
+
 private:
     class Impl;
     std::shared_ptr<Impl> impl_;

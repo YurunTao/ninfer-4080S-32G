@@ -329,31 +329,65 @@ public:
             throw RequestError(RequestErrorKind::Overloaded,
                                "session restore requires an idle Engine lane");
         }
-        const typename ResourceManagement::CatalogSlotView view = resources_.catalog_slot(slot);
-        if (view.state == ResourceManagement::CatalogState::Catalogued &&
-            view.handle != nullptr) {
-            // Involuntary for whatever session held the slot: the client asked for a restore,
-            // not for that session's destruction.
-            spill_catalog_slot(slot, *view.handle);
-            auto evicted = resources_.take_catalogued(slot);
-            (void)instance_.program->release_continuation(std::move(evicted));
+        return restore_retained_lane_locked(slot, snapshot, model_binding, session_path);
+    }
+
+    // Autonomous session resume: materialize `snapshot` into the cheapest replaceable catalog
+    // slot when the engine has a free lane and no resident session already covers the matched
+    // frontier. Returns false when the restore could not run; the caller then takes the ordinary
+    // cold path, so a failure is never worse than not having the feature.
+    [[nodiscard]] bool restore_session_best_effort(std::span<const std::uint8_t> snapshot,
+                                                   std::string_view model_binding,
+                                                   std::string_view session_path,
+                                                   std::uint32_t matched_frontier,
+                                                   std::string_view matched_digest) {
+        std::scoped_lock lock(execution_mutex_);
+        if (!context_cache_enabled_ || materializing_ ||
+            instance_.program->has_context_transaction()) {
+            return false;
         }
-        slot_session_paths_[slot].clear();
-        auto restored             = instance_.program->restore_continuation(snapshot, model_binding);
-        const std::uint32_t tokens = instance_.program->continuation_depth(restored);
-        std::string digest         = instance_.program->continuation_digest(restored);
-        const auto summary         = instance_.program->continuation_summary(restored);
+        if (session_resident_locked(matched_frontier, matched_digest)) {
+            // A live lane already holds this history; the ordinary exact-reuse path is cheaper
+            // than materializing a second copy.
+            return true;
+        }
+        bool have_idle_lane = false;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            have_idle_lane = have_idle_lane || slots_[lane] == nullptr;
+        }
+        if (!have_idle_lane) { return false; }
+        const std::optional<std::uint32_t> slot = cheapest_replaceable_slot_locked();
+        if (!slot) { return false; }
         try {
-            resources_.adopt_restored(slot, std::move(restored), summary);
+            (void)restore_retained_lane_locked(*slot, snapshot, model_binding, session_path);
         } catch (...) {
-            // adopt_restored throws only before taking the handle; drop the orphaned
-            // continuation instead of leaking its physical state.
-            (void)instance_.program->release_continuation(std::move(restored));
-            throw;
+            return false;
         }
-        if (!session_path.empty()) { slot_session_paths_[slot] = session_path; }
-        publish_runtime_stats();
-        return {tokens, std::move(digest)};
+        return true;
+    }
+
+    // Snapshot every catalogued session through the eviction sink (the on-disk store allocates
+    // write-once paths). Used by the server's shutdown flush; failures skip that session.
+    std::size_t save_all_catalogued_sessions() {
+        std::scoped_lock lock(execution_mutex_);
+        if (!eviction_sink_) { return 0; }
+        std::size_t saved = 0;
+        for (std::uint32_t slot = 0; slot < resources_.catalog_capacity(); ++slot) {
+            const typename ResourceManagement::CatalogSlotView view = resources_.catalog_slot(slot);
+            if (view.state != ResourceManagement::CatalogState::Catalogued ||
+                view.handle == nullptr) {
+                continue;
+            }
+            try {
+                auto snapshot =
+                    instance_.program->save_continuation(*view.handle, eviction_model_binding_);
+                eviction_sink_(std::string(), std::move(snapshot));
+                ++saved;
+            } catch (...) {
+                // A session that cannot be serialized is not a reason to abort the flush.
+            }
+        }
+        return saved;
     }
 
     std::uint32_t erase_retained_lane(std::uint32_t slot, std::string_view expected_digest) {
@@ -388,12 +422,16 @@ public:
 
     // Installs the auto-save sink: the model binding save_continuation needs, and a consumer
     // that receives (path, snapshot) for each spilled session and writes the file off-thread.
+    // spill_unbound spills sessions that were never bound to a client-named slot file; the
+    // on-disk store allocates their write-once path instead.
     void set_eviction_sink(
         std::string model_binding,
-        std::function<void(std::string, targets::qwen3_6::RetainedSessionSnapshot&&)> sink) {
+        std::function<void(std::string, targets::qwen3_6::RetainedSessionSnapshot&&)> sink,
+        bool spill_unbound = false) {
         std::scoped_lock lock(execution_mutex_);
         eviction_model_binding_ = std::move(model_binding);
         eviction_sink_          = std::move(sink);
+        eviction_spill_unbound_ = spill_unbound;
     }
 
 private:
@@ -426,19 +464,99 @@ private:
         }
     }
 
+    // The restore body shared by the client-named and autonomous paths. The caller holds
+    // execution_mutex_ and has already established that a lane is free.
+    std::pair<std::uint32_t, std::string>
+    restore_retained_lane_locked(std::uint32_t slot, std::span<const std::uint8_t> snapshot,
+                                 std::string_view model_binding, std::string_view session_path) {
+        const typename ResourceManagement::CatalogSlotView view = resources_.catalog_slot(slot);
+        if (view.state == ResourceManagement::CatalogState::Catalogued &&
+            view.handle != nullptr) {
+            // Involuntary for whatever session held the slot: the caller asked for a restore,
+            // not for that session's destruction.
+            spill_catalog_slot(slot, *view.handle);
+            auto evicted = resources_.take_catalogued(slot);
+            (void)instance_.program->release_continuation(std::move(evicted));
+        }
+        slot_session_paths_[slot].clear();
+        auto restored             = instance_.program->restore_continuation(snapshot, model_binding);
+        const std::uint32_t tokens = instance_.program->continuation_depth(restored);
+        std::string digest         = instance_.program->continuation_digest(restored);
+        const auto summary         = instance_.program->continuation_summary(restored);
+        try {
+            resources_.adopt_restored(slot, std::move(restored), summary);
+        } catch (...) {
+            // adopt_restored throws only before taking the handle; drop the orphaned
+            // continuation instead of leaking its physical state.
+            (void)instance_.program->release_continuation(std::move(restored));
+            throw;
+        }
+        if (!session_path.empty()) { slot_session_paths_[slot] = session_path; }
+        publish_runtime_stats();
+        return {tokens, std::move(digest)};
+    }
+
+    // Cheapest catalog cell to overwrite: an empty cell first, then the shallowest retained
+    // session. Cells in use by an active request or a resource transaction are never chosen.
+    [[nodiscard]] std::optional<std::uint32_t> cheapest_replaceable_slot_locked() const {
+        std::optional<std::uint32_t> best;
+        std::uint32_t best_depth = 0;
+        for (std::uint32_t slot = 0; slot < resources_.catalog_capacity(); ++slot) {
+            const typename ResourceManagement::CatalogSlotView view =
+                resources_.catalog_slot(slot);
+            if (view.state == ResourceManagement::CatalogState::Claimed ||
+                view.state == ResourceManagement::CatalogState::ReservedForActive ||
+                view.active_references != 0) {
+                continue;
+            }
+            if (view.state != ResourceManagement::CatalogState::Catalogued ||
+                view.handle == nullptr) {
+                return slot;
+            }
+            const std::uint32_t depth = instance_.program->continuation_depth(*view.handle);
+            if (!best || depth < best_depth) {
+                best       = slot;
+                best_depth = depth;
+            }
+        }
+        return best;
+    }
+
+    // Whether any resident session can already rewind to (frontier, digest).
+    [[nodiscard]] bool session_resident_locked(std::uint32_t frontier,
+                                               std::string_view digest) const {
+        if (frontier == 0 || digest.empty()) { return false; }
+        for (std::uint32_t slot = 0; slot < resources_.catalog_capacity(); ++slot) {
+            const typename ResourceManagement::CatalogSlotView view =
+                resources_.catalog_slot(slot);
+            if (view.state != ResourceManagement::CatalogState::Catalogued ||
+                view.handle == nullptr) {
+                continue;
+            }
+            for (const SlotCheckpoint& checkpoint :
+                 instance_.program->continuation_checkpoints(*view.handle)) {
+                if (checkpoint.frontier == frontier && checkpoint.session_digest == digest) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     // Best-effort spill of a retained session about to be destroyed involuntarily. The device
     // snapshot runs on the calling thread (it synchronizes the stream); the file write happens
-    // on the Engine's writer thread through the sink. Only sessions bound to a slot file are
-    // spilled, and a spill failure never blocks the eviction itself.
+    // on the Engine's writer thread through the sink. Only sessions bound to a slot file (or,
+    // with eviction_spill_unbound_, every session) are spilled, and a spill failure never
+    // blocks the eviction itself.
     void spill_catalog_slot(std::uint32_t slot,
                             const typename Package::ContinuationHandle& handle) noexcept {
-        if (!eviction_sink_ || slot >= slot_session_paths_.size() ||
-            slot_session_paths_[slot].empty()) {
-            return;
-        }
+        if (!eviction_sink_) { return; }
+        const std::string bound =
+            slot < slot_session_paths_.size() ? slot_session_paths_[slot] : std::string();
+        if (bound.empty() && !eviction_spill_unbound_) { return; }
         try {
             auto snapshot = instance_.program->save_continuation(handle, eviction_model_binding_);
-            eviction_sink_(slot_session_paths_[slot], std::move(snapshot));
+            eviction_sink_(bound, std::move(snapshot));
         } catch (...) {
             // The session was going to be destroyed either way; losing the spill costs the
             // client one cold prefill, exactly the pre-feature behavior.
@@ -2308,6 +2426,7 @@ private:
     // that drains it lives in Engine::Impl. Guarded by execution_mutex_.
     std::string eviction_model_binding_;
     std::function<void(std::string, targets::qwen3_6::RetainedSessionSnapshot&&)> eviction_sink_;
+    bool eviction_spill_unbound_ = false;
     // Fork-local session persistence, guarded by execution_mutex_: the session file each slot
     // is bound to (spill target on eviction) and the digest/checkpoint cache that keeps stats
     // publication from hashing a deep ledger every unit.

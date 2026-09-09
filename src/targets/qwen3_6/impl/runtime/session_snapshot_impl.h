@@ -1,6 +1,8 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
 
+#include "runtime/contract/ledger_digest.h"
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -38,6 +40,8 @@
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
+
+using ninfer::runtime::ledger_prefix_digest;
 
 constexpr char kSessionSnapshotMagic[8]         = {'N', 'I', 'N', 'F', 'S', 'E', 'S', '1'};
 constexpr std::uint32_t kSessionSnapshotVersion = 3;
@@ -460,6 +464,7 @@ ProgramImplCore::save_continuation(const ContinuationHandle& continuation,
     qwen3_6::RetainedSessionSnapshot snapshot;
     snapshot.tokens         = session.tokens;
     snapshot.session_digest = ledger_digest(sequence.ledger);
+    snapshot.checkpoints    = continuation_checkpoints(continuation);
     SnapshotWriter writer(snapshot.bytes);
     writer.bytes(kSessionSnapshotMagic, sizeof(kSessionSnapshotMagic));
     writer.pod(kSessionSnapshotVersion);

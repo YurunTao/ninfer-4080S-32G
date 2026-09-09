@@ -72,6 +72,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--turn-checkpoints N (retired)] [--log-stats-interval-ms N] "
+           "[--session-auto-restore] [--auto-save-on-stop] "
+           "[--max-snapshot-disk-gib N] "
            "[--device N] "
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
@@ -107,6 +109,13 @@ std::string serve_usage_text(const char* argv0) {
            "       --auto-save-evicted spills an involuntarily evicted session back to the "
            "slot file it was last saved to or restored from, before the eviction destroys it "
            "(requires --slot-save-path; explicit erase never auto-saves)\n"
+           "       --session-auto-restore resumes the deepest stored session matching an "
+           "incoming prompt before scheduling it, without any client session header "
+           "(requires --slot-save-path; a miss falls back to a cold prefill)\n"
+           "       --auto-save-on-stop flushes every retained session into the store on a "
+           "clean shutdown (requires --slot-save-path)\n"
+           "       --max-snapshot-disk-gib bounds the store directory (0 = unlimited); the "
+           "least recently used snapshots are pruned first\n"
            "       --model-id overrides the artifact identity.model_id reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
@@ -195,6 +204,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.deprecated_turn_checkpoints_given = true;
         } else if (arg == "--auto-save-evicted") {
             options.auto_save_evicted = true;
+        } else if (arg == "--session-auto-restore") {
+            options.session_auto_restore = true;
+        } else if (arg == "--auto-save-on-stop") {
+            options.auto_save_on_stop = true;
+        } else if (arg == "--max-snapshot-disk-gib") {
+            const int gib = parse_nonnegative_int(require_value("--max-snapshot-disk-gib"),
+                                                  "max-snapshot-disk-gib");
+            options.session_store_bytes = static_cast<std::uint64_t>(gib) << 30;
         } else if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {
@@ -359,6 +376,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.auto_save_evicted && options.slot_save_path.empty()) {
         throw std::invalid_argument("--auto-save-evicted requires --slot-save-path");
+    }
+    if ((options.session_auto_restore || options.auto_save_on_stop) &&
+        options.slot_save_path.empty()) {
+        throw std::invalid_argument(
+            "--session-auto-restore and --auto-save-on-stop require --slot-save-path");
     }
     if (!options.allow_prefix_reuse) {
         if (context_capacity_explicit) {

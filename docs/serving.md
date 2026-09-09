@@ -111,6 +111,34 @@ save. Sessions never saved or restored have no binding and are not spilled; an e
 `erase` is a deletion request and never auto-saves. The console reports each spill as
 `slot auto-save file=... n_saved=...`.
 
+#### On-disk session store and autonomous resume
+
+Every snapshot written into `--slot-save-path` is accompanied by a small text sidecar
+(`<snapshot>.meta`) recording the storage frontier, the session digest, and each restorable
+checkpoint (frontier and the digest of the ledger prefix it covers). At startup the server
+indexes the directory from sidecars alone - no snapshot payload is read - and logs
+`session store dir=... indexed=... auto-restore=... budget=...`.
+
+`--session-auto-restore` uses that index to resume sessions without any client action. Each
+incoming request hashes its prompt prefixes against the indexed checkpoints; when the deepest
+match is not already resident, the server restores that snapshot into the cheapest free lane
+before scheduling the request, so the request arrives at a lane that already holds its
+history and reuses it through the ordinary exact-verification path. The digest only narrows
+candidates: a mismatch simply re-prefills. A full lane set, a busy catalog, an unreadable
+file, or any other failure falls back to the cold path, so the feature can never make a
+request fail that would otherwise succeed.
+
+Evicted sessions spill into the store as write-once snapshots (`snap_<time>_<seq>.slot` plus
+sidecar); an existing snapshot is never rewritten, so a crash mid-write cannot corrupt an
+indexed session. `--max-snapshot-disk-gib N` bounds the directory (default 20, `0` =
+unlimited): the least recently used snapshots are pruned first and the newest always survives.
+Orphaned `.tmp` files and sidecars whose snapshot disappeared are cleaned at startup.
+`--auto-save-on-stop` flushes every retained session into the store on a clean shutdown and
+logs `session flush on stop n_saved=...`.
+
+`GET /slots` still reports per-slot occupancy; explicit `save`/`restore`/`erase` are unchanged
+and continue to use client-named files, which the store also indexes.
+
 `GET /health` returns HTTP 200 with `{"status":"ok"}` while the Engine can accept work. After an
 Engine-wide failure it returns HTTP 503 with `{"status":"unavailable"}`. Temporary queue
 saturation does not make the Engine unavailable. The endpoint remains unauthenticated.
@@ -825,6 +853,9 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--slot-save-path DIR` | enable `/slots/{id}?action=save\|restore\|erase` session persistence into DIR | disabled |
 | `--turn-checkpoints N` | retained turn checkpoints per slot for mid-history prompt reuse; see [turn-checkpoint-ring.md](turn-checkpoint-ring.md) | `0` |
 | `--auto-save-evicted` | spill an involuntarily evicted session back to its bound slot file; requires `--slot-save-path` | off |
+| `--session-auto-restore` | resume the deepest stored session matching an incoming prompt without any client action; requires `--slot-save-path` | off |
+| `--auto-save-on-stop` | flush every retained session into the store on a clean shutdown; requires `--slot-save-path` | off |
+| `--max-snapshot-disk-gib N` | bound the snapshot directory in GiB (`0` = unlimited); least-recently-used snapshots prune first | `20` |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8` | KV-cache storage; rotated and E8-lattice modes trade key/value precision for capacity | `bf16` |

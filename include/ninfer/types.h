@@ -88,6 +88,14 @@ struct LoadProgress {
     std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
 };
 
+// One retained turn checkpoint of a resident session: the ledger depth it rewinds to and the
+// digest of the ledger prefix up to that frontier (same 64-bit hash hex encoding as
+// SlotState::session_digest, computed over the prefix only).
+struct SlotCheckpoint {
+    std::uint32_t frontier = 0;
+    std::string session_digest;
+};
+
 // Outcome of one background auto-save of an involuntarily evicted session. Delivered on the
 // Engine's writer thread; the listener must be thread-safe.
 struct SlotAutoSaveEvent {
@@ -95,6 +103,9 @@ struct SlotAutoSaveEvent {
     std::uint32_t tokens = 0;
     std::size_t bytes    = 0;
     double seconds       = 0.0;
+    std::string session_digest;
+    // Restorable frontiers carried by the written image, for sidecar/index publication.
+    std::vector<SlotCheckpoint> checkpoints;
     std::string error; // empty on success
 };
 
@@ -143,6 +154,15 @@ struct EngineOptions {
     bool auto_save_evicted = false;
     // Optional observer for auto-save outcomes; called on the writer thread.
     std::function<void(const SlotAutoSaveEvent&)> auto_save_listener;
+    // On-disk session store. A non-empty directory indexes every snapshot sidecar in it at
+    // construction, so a restarted server can resume saved sessions without a client naming a
+    // slot file. Evicted sessions are spilled into the store as write-once snapshots, and the
+    // store prunes itself to session_store_bytes (0 = unlimited).
+    std::filesystem::path session_store_dir;
+    std::uint64_t session_store_bytes = 0;
+    // Restore the deepest stored session matching an incoming prompt before scheduling it.
+    // Requires session_store_dir and the context cache; a miss falls back to a cold prefill.
+    bool session_auto_restore = false;
     KvCacheStorage kv_cache       = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
@@ -958,26 +978,21 @@ struct ContextCostSummary {
 };
 
 // Session persistence outcomes. Tokens count the resident session depth moved; bytes count the
-// snapshot file payload on disk; session_digest identifies the session (see SlotState).
+// snapshot file payload on disk; session_digest identifies the session (see SlotState);
+// checkpoints lists the restorable frontiers the written image carries, so a caller can index
+// the snapshot without reading it back.
 struct SlotSaveResult {
     std::uint32_t tokens = 0;
     std::uint64_t bytes  = 0;
     double seconds       = 0.0;
     std::string session_digest;
+    std::vector<SlotCheckpoint> checkpoints;
 };
 
 struct SlotRestoreResult {
     std::uint32_t tokens = 0;
     std::uint64_t bytes  = 0;
     double seconds       = 0.0;
-    std::string session_digest;
-};
-
-// One retained turn checkpoint of a resident session: the ledger depth it rewinds to and the
-// digest of the ledger prefix up to that frontier (same FNV-1a 64 hex encoding as
-// SlotState::session_digest, computed over the prefix only).
-struct SlotCheckpoint {
-    std::uint32_t frontier = 0;
     std::string session_digest;
 };
 

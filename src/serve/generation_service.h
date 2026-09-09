@@ -135,6 +135,10 @@ public:
         return engine_->slot_states();
     }
 
+    // Shutdown flush: snapshot every retained session into the on-disk store and wait for the
+    // files to land. Returns the number of sessions written (0 without a store).
+    std::size_t flush_sessions();
+
     // The slot id space of /slots operations: one slot per private continuation-catalog cell
     // (resolved at Engine construction; at least max_concurrency).
     [[nodiscard]] std::uint32_t slot_count() const {

@@ -62,6 +62,10 @@ struct RetainedSessionSnapshot {
     std::vector<std::uint8_t> bytes;
     std::uint32_t tokens = 0;
     std::string session_digest;
+    // Restorable frontiers inside this image, each with the digest of the ledger prefix it
+    // covers, so a later process can index the snapshot without reading its payload. The
+    // storage frontier (`tokens`) is always present.
+    std::vector<SlotCheckpoint> checkpoints;
 };
 
 // Fork-local: cumulative transfer volume moved by session save/restore. These copies run outside

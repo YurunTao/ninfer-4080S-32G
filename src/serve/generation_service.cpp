@@ -240,7 +240,20 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.turn_checkpoint_ring     = options_.turn_checkpoint_ring;
     engine_options.auto_save_evicted        = options_.auto_save_evicted;
-    if (options_.auto_save_evicted) {
+    if (!options_.slot_save_path.empty()) {
+        // The slot directory doubles as the on-disk session store: snapshots written here get
+        // sidecars, the startup rebuild indexes them, and evicted sessions spill into it.
+        std::error_code directory_error;
+        std::filesystem::create_directories(options_.slot_save_path, directory_error);
+        if (directory_error) {
+            throw std::invalid_argument("--slot-save-path is unusable: " +
+                                        directory_error.message());
+        }
+        engine_options.session_store_dir   = options_.slot_save_path;
+        engine_options.session_store_bytes = options_.session_store_bytes;
+    }
+    engine_options.session_auto_restore = options_.session_auto_restore;
+    if (options_.auto_save_evicted || !options_.slot_save_path.empty()) {
         engine_options.auto_save_listener = [](const ninfer::SlotAutoSaveEvent& event) {
             if (event.error.empty()) {
                 write_console_log(ConsoleLogLevel::Info,
@@ -268,6 +281,22 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     prompt_capabilities_ = engine_->prompt_capabilities();
     request_capacity_    = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
+    if (!options_.slot_save_path.empty()) {
+        write_console_log(ConsoleLogLevel::Info,
+                          "session store dir=" + options_.slot_save_path +
+                              " indexed=" + std::to_string(engine_->session_index_size()) +
+                              " auto-restore=" + (options_.session_auto_restore ? "on" : "off") +
+                              " budget=" + std::to_string(options_.session_store_bytes));
+    }
+}
+
+std::size_t GenerationService::flush_sessions() {
+    const std::size_t saved = engine_->save_all_sessions();
+    if (saved != 0) {
+        write_console_log(ConsoleLogLevel::Info,
+                          "session flush on stop n_saved=" + std::to_string(saved));
+    }
+    return saved;
 }
 
 std::shared_ptr<RequestLifetime>

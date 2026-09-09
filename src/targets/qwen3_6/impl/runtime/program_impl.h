@@ -3,6 +3,7 @@
 #include "targets/qwen3_6/impl/runtime/rebuild_work.h"
 
 #include "core/nvtx.h"
+#include "runtime/contract/ledger_digest.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/linear.h"
@@ -30,6 +31,8 @@
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
 
+using ninfer::runtime::ledger_prefix_digest;
+
 std::uint32_t normalized_private_capacity(const ContextCacheOptions& options) {
     if (!options.max_private_continuations || *options.max_private_continuations == 0) {
         throw std::logic_error("Qwen3.6 context cache private capacity is not normalized");
@@ -38,22 +41,6 @@ std::uint32_t normalized_private_capacity(const ContextCacheOptions& options) {
 }
 
 using Clock = std::chrono::steady_clock;
-
-// Session identity over a ledger prefix: FNV-1a 64 of the token bytes, rendered as 16 hex
-// chars. The full-ledger form is the session_digest clients see; a checkpoint's digest is
-// the same hash over the prefix its frontier covers (session_snapshot_impl.h calls through
-// here for the full ledger).
-std::string ledger_prefix_digest(std::span<const TokenId> ledger) {
-    std::uint64_t hash = 1469598103934665603ULL;
-    const auto* bytes  = reinterpret_cast<const unsigned char*>(ledger.data());
-    const std::size_t count = ledger.size() * sizeof(TokenId);
-    for (std::size_t index = 0; index < count; ++index) {
-        hash = (hash ^ bytes[index]) * 1099511628211ULL;
-    }
-    char text[17];
-    std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(hash));
-    return text;
-}
 
 std::uint64_t elapsed_ns(Clock::time_point started) noexcept {
     const auto elapsed =
