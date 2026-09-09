@@ -13,6 +13,10 @@
 #include <optional>
 #include <span>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
 namespace ninfer::runtime {
 
 using ::ninfer::FinishReason;
@@ -244,15 +248,32 @@ struct PrefillWork {
     result.tokens                       = suffix_tokens;
     result.vision_items                 = vision_items;
     result.vision_patches               = vision_patches;
-    const unsigned __int128 suffix      = suffix_tokens;
-    const unsigned __int128 linear      = static_cast<unsigned __int128>(prefix_tokens) * suffix;
-    const unsigned __int128 triangular  = suffix * (suffix + 1U) / 2U;
-    constexpr unsigned __int128 maximum = ~static_cast<unsigned __int128>(0);
-    const unsigned __int128 attention =
-        triangular > maximum - linear ? maximum : linear + triangular;
-    result.attention_pairs = attention > std::numeric_limits<std::uint64_t>::max()
-                                 ? std::numeric_limits<std::uint64_t>::max()
-                                 : static_cast<std::uint64_t>(attention);
+    const std::uint64_t maximum = std::numeric_limits<std::uint64_t>::max();
+    // 64x64 -> high 64 bits of the 128-bit product. MSVC x64 has no __int128; the intrinsic
+    // mirrors the portable expression.
+    const auto multiply_high = [](std::uint64_t left, std::uint64_t right) noexcept {
+#if defined(_MSC_VER)
+        return __umulh(left, right);
+#else
+        return static_cast<std::uint64_t>((static_cast<unsigned __int128>(left) * right) >> 64U);
+#endif
+    };
+    const auto saturating_product = [maximum](std::uint64_t left, std::uint64_t right) noexcept {
+        return left != 0U && right > maximum / left ? maximum : left * right;
+    };
+    const auto saturating_add = [maximum](std::uint64_t left, std::uint64_t right) noexcept {
+        return right > maximum - left ? maximum : left + right;
+    };
+    const std::uint64_t linear  = saturating_product(prefix_tokens, suffix_tokens);
+    std::uint64_t triangular    = maximum;
+    if (suffix_tokens != maximum) {  // suffix_tokens + 1U must not wrap
+        const std::uint64_t product_high = multiply_high(suffix_tokens, suffix_tokens + 1U);
+        const std::uint64_t product_low  = suffix_tokens * (suffix_tokens + 1U);
+        if (product_high < 2U) {  // exact product stays below 2^65; product is always even
+            triangular = (product_high << 63U) | (product_low >> 1U);
+        }
+    }
+    result.attention_pairs = saturating_add(linear, triangular);
     return result;
 }
 

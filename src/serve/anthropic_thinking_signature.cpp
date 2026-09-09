@@ -1,6 +1,14 @@
+#if defined(_WIN32)
+#define _CRT_RAND_S
+#endif
+
 #include "serve/anthropic_thinking_signature.h"
 
+#ifdef _WIN32
+#include <cstdlib>
+#else
 #include <sys/random.h>
+#endif
 
 #include <array>
 #include <bit>
@@ -188,6 +196,20 @@ bool decode_digest(std::string_view encoded, Digest& digest) {
 AnthropicThinkingSigner::Key random_key() {
     AnthropicThinkingSigner::Key key{};
     std::size_t offset = 0;
+#ifdef _WIN32
+    while (offset < key.size()) {
+        unsigned int value = 0;
+        if (::rand_s(&value) != 0) {
+            throw std::runtime_error("failed to initialize Anthropic Thinking signer");
+        }
+        const std::size_t remaining = key.size() - offset;
+        const std::size_t count     = remaining < sizeof(value) ? remaining : sizeof(value);
+        for (std::size_t index = 0; index < count; ++index) {
+            key[offset + index] = static_cast<std::uint8_t>(value >> (8U * index));
+        }
+        offset += count;
+    }
+#else
     while (offset < key.size()) {
         const ssize_t count = ::getrandom(key.data() + offset, key.size() - offset, 0);
         if (count < 0) {
@@ -200,6 +222,7 @@ AnthropicThinkingSigner::Key random_key() {
         }
         offset += static_cast<std::size_t>(count);
     }
+#endif
     return key;
 }
 

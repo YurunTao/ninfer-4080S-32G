@@ -38,6 +38,7 @@ models/
 vcpkg_installed/
 
 # Local workspace and transient runtime output
+/ninfer-sessions/
 /.local/
 /temp/
 /temp-*/
