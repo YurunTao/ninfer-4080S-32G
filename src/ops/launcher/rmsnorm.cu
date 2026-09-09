@@ -1,4 +1,5 @@
 // ninfer::ops - RMSNorm launcher: finite semantic dispatch over general row geometries.
+#include "ops/launcher/device_sms.h"
 #include "ops/launcher/rmsnorm.h"
 
 #include "ops/kernel/rmsnorm.cuh"
@@ -15,9 +16,15 @@ namespace {
 // prefetch is the only source of overlap and those kernels run at 0.83x to 0.96x; above it a
 // second resident block already supplies that overlap and only the register cost is left (35 -> 50
 // on the warp kernel), which measures 1.02x to 1.14x. Swept over grid size on both gated shapes
-// the crossing sits between 176 and 192 blocks; this is the 170 SMs of this part, a literal
-// because nothing in the tree queries the device, so it is not portable.
-constexpr std::int64_t kRmsPrefetchBlocks = 170;
+// the crossing sits between 176 and 192 blocks on the 170-SM part the sweep was run on; the
+// threshold is one resident block per SM, so it is taken from the real device here.
+// Runtime-initialized: the crossing depends on the resident SM count of the actual device.
+const std::int64_t kRmsPrefetchBlocks = [] {
+    const int sms = device_multiprocessor_count();
+    // One block per SM is the prefetch/no-prefetch crossing; keep the original 170-SM sweep
+    // margin (176..192, i.e. up to ~1.13x one block per SM) by capping at 1.13x.
+    return static_cast<std::int64_t>(sms * 113 / 100);
+}();
 
 template <RmsEpilogue Epilogue>
 void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tensor& out,

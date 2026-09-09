@@ -1,5 +1,6 @@
 // ninfer::ops - split-KV causal small-T launcher and unified route dispatcher. INT8 Q/K
 // preparation, including their paired fixed rotation, remains private to the included kernel.
+#include "ops/launcher/device_sms.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include "ops/common/math.h"
@@ -58,12 +59,14 @@ std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens
         constexpr std::int32_t kKeysPerSplit = Geometry::SmallTSplitScale == 2 ? 17 : 24;
         return div_up(window, kKeysPerSplit);
     }
-    // Bc=64 is one CTA/SM on these model shapes. Keep the 8K grid at or below
-    // one 170-SM wave after accounting for the geometry's KV-head count.
+    // Bc=64 is one CTA/SM on these model shapes. Keep the 8K grid at or below one resident
+    // wave: the grid is KV-heads x splits, so the split cap is the real SM count over four
+    // KV heads (the upstream 42 literal was the 170-SM case of exactly this).
     if (kv_dtype == DType::I8 && tokens == 6 && window > 5000 && window <= 8198) {
         const std::int32_t splits   = div_up(window, 192 / Geometry::SmallTSplitScale);
-        constexpr std::int32_t kMin = 4 * Geometry::SmallTSplitScale;
-        constexpr std::int32_t kMax = 42 * Geometry::SmallTSplitScale;
+        const std::int32_t kMin     = 4 * Geometry::SmallTSplitScale;
+        const std::int32_t wave     = device_multiprocessor_count() / 4;
+        const std::int32_t kMax     = (wave > 0 ? wave : 1) * Geometry::SmallTSplitScale;
         const std::int32_t clamped  = (splits > kMin) ? splits : kMin;
         return (clamped < kMax) ? clamped : kMax;
     }

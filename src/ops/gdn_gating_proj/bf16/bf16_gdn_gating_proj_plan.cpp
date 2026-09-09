@@ -26,25 +26,33 @@ struct RouteSpec {
     Bf16GdnGatingScheduleId schedule;
 };
 
-constexpr std::array<RouteSpec, 6> k27Routes{{
+constexpr std::array<RouteSpec, 5> k27Routes{{
     {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
     {{2, 8}, Bf16GdnGatingScheduleId::SmallTSplit10},
-    // RTX 5090/170-SM performance policy: as token tiles double, halve SplitK to keep the preferred
-    // full grid near 192 CTAs. The launcher independently enforces actual-device residency.
-    {{9, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
-    {{1025, 2048}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
-    {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
-    {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
+    // RTX 4080 SUPER (AD103, 80 SMs). The cuobjdump -res-usage figures on the sm_89 objects match
+    // the sm_86 measurements exactly - split8 (256 threads, 65 regs) admits 2 CTAs/SM -> 160
+    // device-wide; split4/2 (512 threads, 74 regs) admit 1 CTA/SM -> 80 - and sm_89 shares the
+    // sm_86 register file, thread, and shared-memory limits per SM. Grid is ceil(T/128)*3*SplitK,
+    // making split8 legal to T<=768 and split2 to T<=1664; beyond that MmaUnsplit (no grid sync)
+    // takes over. Split4 reaches the same 768 ceiling as split8 while doing less work per launch,
+    // so it is unreachable on this target. The launcher independently enforces actual-device
+    // residency through multiprocessor_count.
+    {{9, 768}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+    {{769, 1664}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
+    {{1665, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
 
 constexpr std::array<RouteSpec, 5> k35Routes{{
-    // RTX 5090/170-SM performance policy: this progression keeps the preferred full grid near
-    // 256 CTAs. The launcher independently enforces actual-device residency.
+    // Same progression on the 80-SM RTX 4080 SUPER. Grid is ceil(T/64)*2*SplitK with per-SM
+    // occupancies carried over unchanged (2 CTAs/SM for split32, 4 for split16, 3 for
+    // split8/4/2), giving device-wide budgets of 160 / 320 / 240. The upstream perf-chosen
+    // bounds of 1024 / 2048 / 4096 would need 256 CTAs at their upper ends and exceed 240, so
+    // split8/4/2 cap at T<=960 / 1920 / 3840; split16 keeps its perf-chosen 127.
     {{1, 127}, Bf16GdnGatingScheduleId::MmaCooperativeSplit16},
-    {{128, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
-    {{1025, 2048}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
-    {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
-    {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
+    {{128, 960}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+    {{961, 1920}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
+    {{1921, 3840}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
+    {{3841, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
 
 template <std::size_t N>

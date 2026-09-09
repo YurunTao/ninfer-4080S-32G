@@ -261,15 +261,31 @@ constexpr std::int32_t cooperative_resident_ctas_per_sm() noexcept {
     static_assert(SplitK > 1);
     if constexpr (std::is_same_v<Geometry, Bf16Gdn27Geometry>) {
         static_assert(SplitK == 8 || SplitK == 4 || SplitK == 2);
+#if defined(NINFER_SM86)
+        // sm_86/89 cuobjdump -res-usage on these objects: BN128 split-8 uses 256 threads at
+        // 65 registers and reaches two resident CTAs per SM; split-4/2 use 512 threads at 74
+        // registers, which is register-bound to one. Shared memory (40 KiB) does not bind.
+        return SplitK == 8 ? 2 : 1;
+#else
         // Qualified on the sm_120a build: BN128 split-8 uses 256 threads and split-4/2 use
         // 512 threads; registers and 40-KiB shared memory admit two resident CTAs per SM.
         return 2;
+#endif
     } else {
         static_assert(std::is_same_v<Geometry, Bf16Gdn35Geometry>);
         static_assert(SplitK == 32 || SplitK == 16 || SplitK == 8 || SplitK == 4 || SplitK == 2);
+#if defined(NINFER_SM86)
+        // sm_86/89 measurements: BN64 split-32 is register-limited to two resident CTAs per SM;
+        // split-16 reaches the shared-memory bound of four; split-8/4/2 are register-bound to
+        // three. Overstating these admits cooperative grids the driver then rejects.
+        if constexpr (SplitK == 32) { return 2; }
+        if constexpr (SplitK == 16) { return 4; }
+        return 3;
+#else
         // BN64 split-32 is register-limited to two resident CTAs per SM. The remaining
         // specializations admit four. These are kernel facts, not a device-wide SM-count policy.
         return SplitK == 32 ? 2 : 4;
+#endif
     }
 }
 

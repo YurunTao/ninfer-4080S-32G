@@ -1,4 +1,5 @@
 // ninfer::ops - rope launcher: private token-count tuning and generic fallback.
+#include "ops/launcher/device_sms.h"
 #include "ops/launcher/rope.h"
 
 #include "core/device.h" // CUDA_CHECK
@@ -13,8 +14,9 @@ constexpr int kLargeBlock               = 256;
 constexpr int kFullChunkBlock           = 192;
 constexpr int kSmallBlock               = 128;
 constexpr int kDefaultChunkTargetTokens = 1024;
-// RTX 5090 has 170 SMs and admits six of these 256-thread CTAs per SM.
-constexpr int kLargeBlockWaveCapacity = 1020;
+// Six of these 256-thread CTAs fit one SM on the family (1536 threads per SM cap); a
+// one-wave large-block grid is therefore 6x the real multiprocessor count.
+const int kLargeBlockWaveCapacity = 6 * device_multiprocessor_count();
 
 template <RopeKernelMode Mode>
 inline constexpr bool kTextMode =
