@@ -1,3 +1,4 @@
+#include "serve/console_log.h"
 #include "serve/openai_responses.h"
 #include "serve/openai_common.h"
 #include "serve/request_validation.h"
@@ -792,13 +793,14 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
             continue;
         }
         if (type != "namespace") {
-            bad_request("tool type '" + type +
-                            "' requires an executor that NInfer does not provide",
-                        "tools", "tool_type_not_supported");
+            write_console_log(ConsoleLogLevel::Warning,
+                              "ignoring unsupported tool type '" + type +
+                                  "': NInfer executes only function and namespace tools");
+            continue;
         }
 
         // OpenAI Responses beta groups functions/custom tools under a namespace. NInfer lowers
-        // only nested functions because custom tools require unsupported free-form decoding.
+        // nested functions and ignores nested types that need unsupported free-form decoding.
         reject_nonnull_unknown_members(item, namespace_members, "tools");
         const std::string namespace_name = require_namespace_tool_name(item);
         if (!namespace_names.insert(namespace_name).second) {
@@ -824,12 +826,19 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
             }
             const std::string nested_type = nested.at("type").get<std::string>();
             if (nested_type != "function") {
-                bad_request("nested tool type '" + nested_type +
-                                "' cannot be represented by the Engine",
-                            "tools", "tool_type_not_supported");
+                write_console_log(ConsoleLogLevel::Warning,
+                                  "ignoring nested tool type '" + nested_type +
+                                      "' in namespace '" + namespace_name + "'");
+                continue;
             }
             canonical["tools"].push_back(append_function(parse_function_tool(
                 nested, namespace_name, namespace_description, out.tool_identities)));
+        }
+        if (canonical.at("tools").empty()) {
+            write_console_log(ConsoleLogLevel::Warning,
+                              "ignoring namespace '" + namespace_name +
+                                  "' because it declares no executable function");
+            continue;
         }
         out.wire_tools.push_back(std::move(canonical));
     }
@@ -852,11 +861,17 @@ void filter_allowed_tools(const Json& choice, ParsedPromptFields& out) {
     std::unordered_set<std::string> declared;
     for (const ToolDefinition& tool : out.prompt.generation.tools) { declared.insert(tool.name); }
     std::unordered_set<std::string> selected;
+    bool ignored_entry = false;
     for (const Json& item : choice.at("tools")) {
-        if (!item.is_object() || !item.contains("type") || !item.at("type").is_string() ||
-            item.at("type").get<std::string>() != "function") {
-            bad_request("allowed_tools only supports function entries", "tool_choice",
-                        "tool_choice_not_supported");
+        if (!item.is_object() || !item.contains("type") || !item.at("type").is_string()) {
+            bad_request("allowed_tools entries must be objects with a string type", "tool_choice");
+        }
+        if (item.at("type").get<std::string>() != "function") {
+            write_console_log(ConsoleLogLevel::Warning,
+                              "ignoring unsupported allowed_tools entry of type '" +
+                                  item.at("type").get<std::string>() + "'");
+            ignored_entry = true;
+            continue;
         }
         static const std::unordered_set<std::string> allowed_entry = {"type", "name", "namespace"};
         reject_nonnull_unknown_members(item, allowed_entry, "tool_choice");
@@ -871,6 +886,13 @@ void filter_allowed_tools(const Json& choice, ParsedPromptFields& out) {
                         "tool_choice", "invalid_tool_choice");
         }
         selected.insert(name);
+    }
+
+    if (ignored_entry && selected.empty()) {
+        write_console_log(ConsoleLogLevel::Warning,
+                          "allowed_tools selected no executable function; keeping every declared "
+                          "tool");
+        return;
     }
 
     std::vector<ToolDefinition> effective;
@@ -922,9 +944,9 @@ void parse_reasoning(const Json& body, OpenAIResponsesPromptRequest& out) {
     reject_nonnull_unknown_members(reasoning, allowed, "reasoning");
     for (const char* key : {"context", "summary", "generate_summary", "mode"}) {
         if (reasoning.contains(key) && !reasoning.at(key).is_null()) {
-            bad_request("reasoning." + std::string(key) +
-                            " changes reasoning input or output and is not supported",
-                        "reasoning", "reasoning_option_not_supported");
+            write_console_log(ConsoleLogLevel::Warning,
+                              "ignoring reasoning." + std::string(key) +
+                                  ": this Engine returns no reasoning summary or context");
         }
     }
     if (!reasoning.contains("effort") || reasoning.at("effort").is_null()) { return; }
@@ -1044,9 +1066,9 @@ ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& li
     parse_tool_choice(body, out);
     out.parallel_tool_calls = optional_bool(body, "parallel_tool_calls", true);
     if (!out.parallel_tool_calls && out.prompt.generation.uses_tools()) {
-        bad_request("parallel_tool_calls=false cannot be guaranteed when callable tools are "
-                    "present",
-                    "parallel_tool_calls", "parallel_tool_calls_not_supported");
+        write_console_log(ConsoleLogLevel::Warning,
+                          "parallel_tool_calls=false is a client preference this Engine cannot "
+                          "guarantee: a response may contain more than one call");
     }
     parse_reasoning(body, out.prompt);
     parse_text(body);
@@ -1195,9 +1217,9 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     if (body.contains("include") && !body.at("include").is_null()) {
         if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
         if (!body.at("include").empty()) {
-            bad_request("the requested additional response fields have no available response "
-                        "representation",
-                        "include", "include_not_supported");
+            write_console_log(ConsoleLogLevel::Warning,
+                              "ignoring include: this local server stores no additional response "
+                              "fields");
         }
     }
     if (body.contains("stream_options") && !body.at("stream_options").is_null()) {

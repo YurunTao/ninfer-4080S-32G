@@ -137,7 +137,6 @@ int test_standard_field_policy() {
     rejected("top_logprobs", 2, "logprobs_not_supported");
     rejected("response_format", Json{{"type", "json_schema"}}, "response_format_not_supported");
     rejected("modalities", Json::array({"text", "audio"}), "modality_not_supported");
-    rejected("web_search_options", Json::object(), "web_search_not_supported");
     rejected("moderation", Json::object(), "moderation_not_supported");
     rejected("verbosity", "high", "verbosity_not_supported");
     rejected("store", true, "store_not_supported");
@@ -156,6 +155,7 @@ int test_standard_field_policy() {
     neutral["store"]                  = false;
     neutral["functions"]              = Json::array();
     neutral["function_call"]          = "auto";
+    neutral["web_search_options"]     = Json::object();
     neutral["metadata"]               = Json{{"trace", "client"}};
     neutral["user"]                   = "user-1";
     neutral["safety_identifier"]      = "safe-1";
@@ -279,16 +279,17 @@ int test_tools() {
     body["tools"] = Json::array({function_tool("weather", true)});
     failures += check(api_error([&] { (void)parse(body); }).code == "strict_tools_not_supported",
                       "strict tools rejected");
-    body["tools"] = Json::array({Json{{"type", "custom"}, {"name", "shell"}}});
-    failures += check(api_error([&] { (void)parse(body); }).code == "tool_type_not_supported",
-                      "custom tools rejected");
+    body["tools"] = Json::array(
+        {Json{{"type", "custom"}, {"name", "shell"}}, function_tool("weather")});
+    const GenerationRequest tolerated = parse(body).generation;
+    failures += check(tolerated.tools.size() == 1 && tolerated.tools[0].name == "weather",
+                      "unsupported tool types are ignored without dropping function tools");
 
     body                        = base_request();
     body["tools"]               = Json::array({function_tool()});
     body["parallel_tool_calls"] = false;
-    failures +=
-        check(api_error([&] { (void)parse(body); }).code == "parallel_tool_calls_not_supported",
-              "parallel_tool_calls=false rejected when tools exist");
+    failures += check(parse(body).generation.tools.size() == 1,
+                      "parallel_tool_calls=false is accepted as a client preference");
     body.erase("tools");
     failures += check(parse(body).generation.tools.empty(),
                       "parallel_tool_calls=false is neutral without tools");

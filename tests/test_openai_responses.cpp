@@ -671,10 +671,13 @@ int test_namespace_tools() {
     Json nested_custom                 = body;
     nested_custom["tool_choice"]       = "auto";
     nested_custom["tools"][0]["tools"] = Json::array({Json{{"type", "custom"}, {"name", "raw"}}});
-    failures += check(api_code([&] {
-                          (void)parse_openai_responses_create_request(nested_custom, limits());
-                      }) == "tool_type_not_supported",
-                      "namespace custom tools remain explicitly unsupported");
+    const OpenAIResponsesCreateRequest filtered =
+        parse_openai_responses_create_request(nested_custom, limits());
+    failures += check(filtered.tools.size() == 1 &&
+                          filtered.tools[0].at("name") == "mcp__weather" &&
+                          filtered.prompt.generation.tools.size() == 1 &&
+                          filtered.prompt.generation.tools[0].name == "mcp__weather__now",
+                      "a namespace whose functions are all unsupported is ignored");
 
     Json oversized           = body;
     oversized["tool_choice"] = "auto";
@@ -686,6 +689,62 @@ int test_namespace_tools() {
                           (void)parse_openai_responses_create_request(oversized, limits());
                       }) == "invalid_tool_name",
                       "flattened identities must fit the Engine tool-name contract");
+    return failures;
+}
+
+int test_unsupported_capability_tolerance() {
+    const Json function = Json{{"type", "function"},
+                               {"name", "weather"},
+                               {"description", "Weather lookup"},
+                               {"parameters", Json{{"type", "object"}}}};
+    int failures        = 0;
+
+    Json hosted           = {{"model", "m"}, {"input", "hello"}};
+    hosted["tool_choice"] = "auto";
+    hosted["tools"]       = Json::array(
+        {Json{{"type", "web_search"}}, Json{{"type", "image_generation"}}, function});
+    const OpenAIResponsesCreateRequest executable =
+        parse_openai_responses_create_request(hosted, limits());
+    failures += check(executable.prompt.generation.tools.size() == 1 &&
+                          executable.prompt.generation.tools[0].name == "weather",
+                      "unsupported tool types are ignored while function tools survive");
+    failures += check(executable.tools.size() == 1 && executable.tools[0].at("type") == "function",
+                      "ignored tool types leave nothing to advertise");
+
+    Json grouped           = {{"model", "m"}, {"input", "hello"}};
+    grouped["tool_choice"] = "auto";
+    grouped["tools"]       = Json::array(
+        {Json{{"type", "namespace"},
+              {"name", "mcp__clock"},
+              {"tools", Json::array({Json{{"type", "custom"}, {"name", "raw"}}, function})}},
+         Json{{"type", "namespace"},
+              {"name", "mcp__empty"},
+              {"tools", Json::array({Json{{"type", "custom"}, {"name", "raw"}}})}}});
+    const OpenAIResponsesCreateRequest namespaced =
+        parse_openai_responses_create_request(grouped, limits());
+    failures += check(namespaced.prompt.generation.tools.size() == 1 &&
+                          namespaced.prompt.generation.tools[0].name == "mcp__clock__weather",
+                      "a namespace keeps its executable function and ignores the others");
+    failures += check(namespaced.tools.size() == 1 && namespaced.tools[0].at("name") == "mcp__clock",
+                      "a namespace with no executable function is dropped");
+
+    Json preference                   = {{"model", "m"}, {"input", "hello"}};
+    preference["tool_choice"]         = "auto";
+    preference["tools"]               = Json::array({function});
+    preference["parallel_tool_calls"] = false;
+    preference["include"]             = Json::array({"reasoning.encrypted_content"});
+    preference["reasoning"]           = Json{{"effort", "high"},
+                                             {"summary", "auto"},
+                                             {"generate_summary", "concise"},
+                                             {"context", "current_turn"},
+                                             {"mode", "standard"}};
+    const OpenAIResponsesCreateRequest tolerant =
+        parse_openai_responses_create_request(preference, limits());
+    failures += check(!tolerant.parallel_tool_calls &&
+                          tolerant.prompt.generation.tools.size() == 1 &&
+                          tolerant.prompt.generation.reasoning_effort ==
+                              RequestedReasoningEffort::High,
+                      "client preferences are accepted while executable options still apply");
     return failures;
 }
 
@@ -970,6 +1029,7 @@ int main() {
     failures += test_assistant_item_boundaries_and_errors();
     failures += test_tools_and_effective_subset();
     failures += test_namespace_tools();
+    failures += test_unsupported_capability_tolerance();
     failures += test_explicit_rejections();
     failures += test_previous_response_call_graph();
     failures += test_response_object();

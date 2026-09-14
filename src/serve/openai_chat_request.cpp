@@ -1,3 +1,4 @@
+#include "serve/console_log.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
 #include "serve/request_validation.h"
@@ -163,10 +164,8 @@ void validate_standard_output_controls(const Json& body) {
     }
 
     if (body.contains("web_search_options") && !body.at("web_search_options").is_null()) {
-        bad_request(
-            "web_search_options requests hosted web search and citations, which NInfer does not "
-            "provide",
-            "web_search_options", "web_search_not_supported");
+        write_console_log(ConsoleLogLevel::Warning,
+                          "ignoring web_search_options: NInfer does not execute hosted web search");
     }
     if (body.contains("moderation") && !body.at("moderation").is_null()) {
         bad_request(
@@ -597,10 +596,10 @@ void parse_tools(const Json& body, GenerationRequest& output) {
         }
         const std::string type = item.at("type").get<std::string>();
         if (type != "function") {
-            bad_request(
-                "tool type '" + type +
-                    "' requires a non-function output contract that NInfer does not provide",
-                "tools", "tool_type_not_supported");
+            write_console_log(ConsoleLogLevel::Warning,
+                              "ignoring unsupported tool type '" + type +
+                                  "': NInfer executes only function tools");
+            continue;
         }
         if (!item.contains("function") || !item.at("function").is_object()) {
             bad_request("function tools must contain a function object", "tools");
@@ -745,10 +744,9 @@ void parse_parallel_tool_calls(const Json& body, const GenerationRequest& output
         bad_request("parallel_tool_calls must be a boolean", "parallel_tool_calls");
     }
     if (!body.at("parallel_tool_calls").get<bool>() && output.uses_tools()) {
-        bad_request(
-            "parallel_tool_calls=false requires the model to emit at most one tool call, which "
-            "NInfer cannot guarantee while tools are enabled",
-            "parallel_tool_calls", "parallel_tool_calls_not_supported");
+        write_console_log(ConsoleLogLevel::Warning,
+                          "parallel_tool_calls=false is a client preference this Engine cannot "
+                          "guarantee: a response may contain more than one call");
     }
 }
 
