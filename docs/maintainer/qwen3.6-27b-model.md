@@ -327,8 +327,10 @@ The native processor accepts structured text/image/video message parts. For each
 Images repeat a frame to form the temporal pair. Videos are sampled at the configured rate and
 packed in temporal pairs. Media items have no standalone count limit; aggregate source bytes,
 decoded pixels, 131,072 raw patches, 32,768 merged Vision tokens, and Engine `max_context` admit the
-work. The prepared BF16 rows are the exact host representation copied into Vision execution, so no
-host FP32 payload or device FP32-to-BF16 staging conversion exists.
+work. A request whose combined media exceeds one of those aggregate limits is trimmed to the newest
+media that fits before any media is prepared. The prepared BF16 rows are the exact host
+representation copied into Vision execution, so no host FP32 payload or device FP32-to-BF16 staging
+conversion exists.
 
 ## 10. Vision tower
 
@@ -434,8 +436,10 @@ Vision item output is live; before that output is produced, Vision encode may re
 backing according to checked patch/position, attention, MLP, and merger lifetimes. The registered
 Frontend retains an aggregate prompt budget of `min(max_context,32768)` Vision tokens, while the
 sequential Vision tower and `[5120,V]` handoff use the registered single-item bound
-`V<=min(max_context,16384)`. Multiple items reuse the same handoff after the previous scatter span
-is complete. Text prefill allocations use `min(prefill_chunk,max_context)`.
+`V<=min(max_context,16384)`. A request whose combined media exceeds the aggregate budget is trimmed
+to the newest media that fits before preparation; the single-item bound and per-item resource limits
+are enforced on the retained media. Multiple items reuse the same handoff after the previous
+scatter span is complete. Text prefill allocations use `min(prefill_chunk,max_context)`.
 
 A zero MTP draft window has no MTP weight view, MTP KV cache, or optimized proposal head. With
 Vision disabled, the Program has no Vision weight view or Vision-specific workspace extent; media

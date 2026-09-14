@@ -38,18 +38,17 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-constexpr int kPatch                              = 16;
-constexpr int kTemporal                           = 2;
-constexpr int kMerge                              = 2;
-constexpr int kFactor                             = kPatch * kMerge;
-constexpr int kPatchFeatures                      = 3 * kTemporal * kPatch * kPatch;
-constexpr int kImageToken                         = 248056;
-constexpr int kVideoToken                         = 248057;
-constexpr std::uint64_t kMinimumRawPatchesPerItem = kMerge * kMerge;
-constexpr std::string_view kImagePad              = "<|image_pad|>";
-constexpr std::string_view kVideoPad              = "<|video_pad|>";
-constexpr std::string_view kVisionStart           = "<|vision_start|>";
-constexpr std::string_view kVisionEnd             = "<|vision_end|>";
+constexpr int kPatch         = 16;
+constexpr int kTemporal      = 2;
+constexpr int kMerge         = 2;
+constexpr int kFactor        = kPatch * kMerge;
+constexpr int kPatchFeatures = 3 * kTemporal * kPatch * kPatch;
+constexpr int kImageToken    = 248056;
+constexpr int kVideoToken    = 248057;
+constexpr std::string_view kImagePad    = "<|image_pad|>";
+constexpr std::string_view kVideoPad    = "<|video_pad|>";
+constexpr std::string_view kVisionStart = "<|vision_start|>";
+constexpr std::string_view kVisionEnd   = "<|vision_end|>";
 
 struct Size {
     int h = 0;
@@ -411,23 +410,31 @@ std::vector<ChatPart*> media_parts(std::vector<ChatMessage>& messages) {
     return out;
 }
 
-std::size_t validate_media_inputs(std::span<ChatPart* const> parts,
-                                  const ProcessorOptions& options) {
-    const std::uint64_t maximum_items_from_extents =
-        std::min(options.max_raw_patches / kMinimumRawPatchesPerItem, options.max_vision_tokens);
-    if (std::cmp_greater(parts.size(), maximum_items_from_extents)) {
-        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                             "minimum Vision grids exceed processor extent budget");
-    }
-    std::size_t remaining = options.max_encoded_media_bytes;
-    for (const ChatPart* part : parts) {
-        if (part->media.bytes.size() > remaining) {
-            throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                                 "request media bytes exceed processor budget");
+// Erase the media parts a MediaPlan dropped, keeping the message list renderable. A message
+// whose parts all were dropped still renders its (empty) turn.
+void drop_dropped_media_parts(std::vector<ChatMessage>& messages,
+                              const std::vector<std::size_t>& dropped) {
+    if (dropped.empty()) { return; }
+    const std::size_t maximum = *std::max_element(dropped.begin(), dropped.end());
+    std::vector<bool> drop(maximum + 1U, false);
+    for (std::size_t index : dropped) { drop[index] = true; }
+    std::size_t part_index = 0;
+    for (ChatMessage& message : messages) {
+        if (message.role == ChatRole::System || message.role == ChatRole::Developer) { continue; }
+        for (auto part = message.parts.begin(); part != message.parts.end();) {
+            // Only non-text parts carry a media index, exactly as media_parts enumerates them.
+            if (part->kind == ChatPartKind::Text) {
+                ++part;
+                continue;
+            }
+            if (part_index < drop.size() && drop[part_index]) {
+                part = message.parts.erase(part);
+            } else {
+                ++part;
+            }
+            ++part_index;
         }
-        remaining -= part->media.bytes.size();
     }
-    return options.max_encoded_media_bytes - remaining;
 }
 
 VisionItem inspect_image_item(std::span<const std::uint8_t> bytes, const ProcessorOptions& options,
@@ -471,6 +478,85 @@ VisionItem inspect_video_item(std::span<const std::uint8_t> bytes, const Process
     item.grid       = {gt, size.h / kPatch, size.w / kPatch};
     item.timestamps = video_timestamps(video.indices, gt, video.fps);
     return item;
+}
+
+// Aggregate media admission. Every item is probed for its Vision grid; the newest items that
+// fit the processor budgets are retained and older items are dropped, so an over-budget request
+// proceeds with its recent media instead of failing. The request still rejects when the newest
+// item alone exceeds an aggregate budget, or a retained item exceeds the fixed per-item Vision
+// execution capacity or its resize policy.
+struct MediaPlan {
+    std::vector<VisionItem> items;                 // Retained items in chat order.
+    std::vector<std::size_t> dropped_part_indices; // Media-part indices, per media_parts order.
+    std::size_t media_bytes = 0;                   // Retained encoded bytes.
+};
+
+MediaPlan plan_media_items(const std::vector<ChatPart*>& parts,
+                           const ProcessorOptions& options,
+                           const media::decode::Policy& policy,
+                           const PreparationControl& control) {
+    struct Probed {
+        VisionItem item;
+        std::size_t bytes;
+    };
+    std::vector<Probed> probed;
+    probed.reserve(parts.size());
+    try {
+        for (const ChatPart* part : parts) {
+            check_preparation_control(control);
+            const VisionItem item = part->kind == ChatPartKind::Image
+                                        ? inspect_image_item(part->media.bytes, options, policy)
+                                        : inspect_video_item(part->media.bytes, options, policy);
+            probed.push_back(Probed{item, part->media.bytes.size()});
+        }
+    } catch (const media::decode::Error& error) { throw_decode_error(error); }
+
+    PreprocessStats retained_budget;
+    std::size_t retained_bytes = 0;
+    std::vector<bool> retained(probed.size(), false);
+    for (std::size_t index = probed.size(); index-- > 0;) {
+        PreprocessStats candidate = retained_budget;
+        add_budget(candidate, probed[index].item);
+        if (candidate.raw_patches > options.max_raw_patches ||
+            candidate.vision_tokens > options.max_vision_tokens ||
+            retained_bytes + probed[index].bytes > options.max_encoded_media_bytes) {
+            continue;
+        }
+        retained[index]      = true;
+        retained_budget      = std::move(candidate);
+        retained_bytes += probed[index].bytes;
+    }
+
+    if (!probed.empty() && !retained.back()) {
+        // Even the newest item alone exceeds an aggregate budget: nothing can be retained.
+        PreprocessStats newest;
+        add_budget(newest, probed.back().item);
+        if (newest.raw_patches > options.max_raw_patches) {
+            throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                                 "vision raw patches exceed processor budget");
+        }
+        if (newest.vision_tokens > options.max_vision_tokens) {
+            throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                                 "vision tokens exceed processor budget");
+        }
+        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                             "request media bytes exceed processor budget");
+    }
+
+    MediaPlan plan;
+    plan.media_bytes = retained_bytes;
+    for (std::size_t index = 0; index < probed.size(); ++index) {
+        if (retained[index]) {
+            enforce_image_resize_policy(*parts[index], options, policy);
+            PreprocessStats item_stats;
+            add_budget(item_stats, probed[index].item);
+            enforce_media_item_resource_limits(item_stats);
+            plan.items.push_back(std::move(probed[index].item));
+        } else {
+            plan.dropped_part_indices.push_back(index);
+        }
+    }
+    return plan;
 }
 
 void append_repeated(std::string& out, std::string_view value, std::uint64_t count) {
@@ -726,7 +812,8 @@ void validate_special_token(const Tokenizer& tokenizer, std::string_view text, i
 
 std::string PreprocessStats::summary() const {
     std::ostringstream out;
-    out << "media=" << media_items << " media_bytes=" << media_bytes << " patches=" << raw_patches
+    out << "media=" << media_items << " media_dropped=" << media_items_dropped
+        << " media_bytes=" << media_bytes << " patches=" << raw_patches
         << " vision_tokens=" << vision_tokens << " attention_pairs=" << attention_pairs
         << " prompt_tokens=" << prompt_tokens << " patch_bytes=" << patch_bytes;
     return out.str();
@@ -875,10 +962,6 @@ std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
                                     ChatRenderOptions render_options,
                                     const PreparationControl& control) const {
     check_preparation_control(control);
-    const std::vector<ChatPart*> parts = media_parts(messages);
-    (void)validate_media_inputs(parts, options_);
-    RenderedChat rendered = chat_template_.render(messages, std::move(render_options));
-    MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
     const media::decode::Policy policy{
         .max_bytes                  = options_.max_encoded_media_bytes,
         .max_decoded_pixels         = options_.max_decoded_pixels,
@@ -887,25 +970,12 @@ std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
         .max_video_duration_seconds = options_.max_video_duration_seconds,
         .checkpoint                 = [&control] { check_preparation_control(control); },
     };
-    std::vector<VisionItem> items;
-    items.reserve(parts.size());
-    PreprocessStats stats;
-    try {
-        for (const ChatPart* part : parts) {
-            check_preparation_control(control);
-            enforce_image_resize_policy(*part, options_, policy);
-            VisionItem item = part->kind == ChatPartKind::Image
-                                  ? inspect_image_item(part->media.bytes, options_, policy)
-                                  : inspect_video_item(part->media.bytes, options_, policy);
-            PreprocessStats item_stats;
-            add_budget(item_stats, item);
-            enforce_media_item_resource_limits(item_stats);
-            add_budget(stats, item);
-            enforce_media_resource_limits(stats, options_);
-            items.push_back(std::move(item));
-        }
-    } catch (const media::decode::Error& error) { throw_decode_error(error); }
-    rendered                = expand_placeholders(std::move(rendered), items);
+    const std::vector<ChatPart*> parts = media_parts(messages);
+    const MediaPlan plan = plan_media_items(parts, options_, policy, control);
+    drop_dropped_media_parts(messages, plan.dropped_part_indices);
+    RenderedChat rendered = chat_template_.render(messages, std::move(render_options));
+    MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
+    rendered = expand_placeholders(std::move(rendered), plan.items);
     const std::size_t count = encode_rendered_chat(tokenizer_, rendered).input_ids.size();
     check_preparation_control(control, "tokenization");
     return count;
@@ -917,8 +987,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                                   std::size_t maximum_prompt_tokens) const {
     check_preparation_control(control);
     const std::vector<ChatPart*> parts = media_parts(messages);
-    const std::size_t media_bytes      = validate_media_inputs(parts, options_);
-    RenderedChat rendered              = chat_template_.render(messages, std::move(render_options));
+    RenderedChat rendered = chat_template_.render(messages, render_options);
     const std::size_t encode_limit =
         maximum_prompt_tokens == std::numeric_limits<std::size_t>::max()
             ? maximum_prompt_tokens
@@ -941,6 +1010,20 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                                      std::to_string(maximum_prompt_tokens));
         }
     }
+    const media::decode::Policy plan_policy{
+        .max_bytes                  = options_.max_encoded_media_bytes,
+        .max_decoded_pixels         = options_.max_decoded_pixels,
+        .max_decoded_video_pixels   = options_.max_decoded_video_pixels,
+        .max_video_source_frames    = options_.max_video_source_frames,
+        .max_video_duration_seconds = options_.max_video_duration_seconds,
+        .checkpoint                 = [&control] { check_preparation_control(control); },
+    };
+    const MediaPlan plan = plan_media_items(parts, options_, plan_policy, control);
+    if (!plan.dropped_part_indices.empty()) {
+        drop_dropped_media_parts(messages, plan.dropped_part_indices);
+        rendered = chat_template_.render(messages, render_options);
+    }
+    const std::vector<ChatPart*> retained_parts = media_parts(messages);
     MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
     std::atomic<bool> stop_preparation{false};
     const PreparationControl worker_control{
@@ -956,23 +1039,21 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         .max_video_duration_seconds = options_.max_video_duration_seconds,
         .checkpoint = [&worker_control] { check_preparation_control(worker_control); },
     };
-    try {
-        for (const ChatPart* part : parts) { enforce_image_resize_policy(*part, options_, policy); }
-    } catch (const media::decode::Error& error) { throw_decode_error(error); }
     ProcessedInput output;
     std::vector<VisionItem> items;
-    items.reserve(parts.size());
+    items.reserve(retained_parts.size());
     PreprocessStats stats;
-    stats.media_items      = parts.size();
-    stats.media_bytes      = media_bytes;
-    stats.tokenize_seconds = preliminary_tokenize_seconds;
+    stats.media_items         = retained_parts.size();
+    stats.media_items_dropped = plan.dropped_part_indices.size();
+    stats.media_bytes         = plan.media_bytes;
+    stats.tokenize_seconds    = preliminary_tokenize_seconds;
 
     std::vector<PendingMedia> pending_items;
-    pending_items.reserve(parts.size());
+    pending_items.reserve(retained_parts.size());
     ConcurrentMediaBudget request_budget(options_);
     std::exception_ptr preparation_error;
     const auto media_phase_started = Clock::now();
-    for (ChatPart* part : parts) {
+    for (ChatPart* part : retained_parts) {
         try {
             check_preparation_control(control);
             const auto digest =
@@ -1045,7 +1126,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         items.push_back(std::move(item));
         output.media_payloads.push_back(std::move(media.payload));
     }
-    for (ChatPart* part : parts) { std::vector<std::uint8_t>().swap(part->media.bytes); }
+    for (ChatPart* part : retained_parts) { std::vector<std::uint8_t>().swap(part->media.bytes); }
     if (preparation_error) {
         try {
             std::rethrow_exception(preparation_error);

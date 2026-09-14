@@ -189,7 +189,8 @@ The endpoint supports:
   streaming `return_progress` observations;
 - non-strict function tools with `tool_choice` `auto`, `none`, or `allowed_tools` in `auto` mode,
   parallel calls enabled, assistant tool-call history, tool-result messages, and legacy
-  function-call history;
+  function-call history; tool types NInfer cannot execute are ignored instead of failing the
+  request;
 - the `reasoning_effort` field, either at top level or in `chat_template_kwargs`;
 - `enable_thinking` and `preserve_thinking`, either at top level or in
   `chat_template_kwargs`;
@@ -197,10 +198,16 @@ The endpoint supports:
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
 behavior. This includes JSON constrained output, nonzero `logit_bias`, requested log probabilities,
-audio/file input or audio output, `strict:true`, required or named tool choice,
-`parallel_tool_calls:false` with enabled tools, explicit low/high image detail, web search,
-moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
-Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
+audio/file input or audio output, `strict:true`, required or named tool choice, explicit low/high
+image detail, moderation, low/high verbosity, stored Chat Completions, and non-empty legacy
+`functions`. Each capability rejection identifies the affected field and the guarantee NInfer
+cannot provide.
+
+Requests that only describe behavior outside the response the Engine produces are accepted and
+reported as a console warning instead of failing: hosted tool types in `tools[]` (for example
+`web_search`) are ignored while executable function tools survive, `web_search_options` is ignored,
+and `parallel_tool_calls:false` stays a client preference this Engine cannot guarantee because a
+response may contain more than one call.
 Known constrained-decoding aliases (`grammar`, `structured_outputs`, `guided_json`, `guided_regex`,
 `guided_choice`, and `guided_grammar`) receive the same explicit rejection instead of being treated
 as unknown hints.
@@ -393,9 +400,19 @@ OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
 
 Text and media requests use one complete-prompt context contract. After chat-template rendering and
 media-token expansion, the result must fit Engine `--max-context`. The current Vision runtime also
-has a 32,768 merged-token envelope (131,072 raw patches); the effective Vision limit is therefore
-`min(--max-context, 32768)`. There is no fixed image/video item-count limit: item count is admitted
-through aggregate source-byte, decoded-pixel, raw-patch, Vision-token, and live-memory budgets.
+has a 32,768 merged-token envelope (131,072 raw patches); the effective Vision limit is
+`min(--max-context, 32768, --vision-max-tokens)` whenever `--vision-max-tokens` is set, and
+`min(--max-context, 32768)` when it is not. The Serve default for `--vision-max-tokens` is 8192,
+so a default Serve accepts at most 8,192 merged Vision tokens (32,768 raw patches) per request.
+There is no fixed image/video item-count limit: item count is admitted through aggregate
+source-byte, decoded-pixel, raw-patch, Vision-token, and live-memory budgets.
+
+When a request's combined media exceeds one of those aggregate budgets, Serve trims the oldest
+media items first and retains the newest media that fits the limit, in message order. The request
+then continues normally; response schemas are unchanged. The retained and dropped item counts are
+recorded in the Serve request log (`media_items` and `media_items_dropped` inside the preparation
+record of each `request_start` line). Aggregate trimming never overrides the fixed per-item
+resources below; only the oldest excess items are dropped.
 
 Media cache misses run as independent decode → resize → BF16-pack tasks on a bounded host worker
 pool. Prepared payloads are keyed by SHA-256 of the acquired bytes plus modality, so repeated media
@@ -407,10 +424,15 @@ released. A request-level preparation gate derived from the live limit prevents 
 builds from deadlocking the memory account.
 
 An expanded prompt beyond `--max-context` returns HTTP 400 `context_length_exceeded`, including
-the prepared token count and configured context ceiling. A media preprocessing resource rejection
-returns HTTP 400 `media_budget_exceeded`. HTTP 413 `request_too_large` is reserved for a raw request
-body that exceeds `--max-request-mib` before JSON parsing; it is not used for model-context or media
-resource errors.
+the prepared token count and configured context ceiling. Even after aggregate trimming, a media
+request returns HTTP 400 `media_budget_exceeded` when the newest single media item alone exceeds
+the effective Vision limit (merged tokens or raw patches), when it exceeds the fixed per-item
+ceiling of 16,384 merged Vision tokens (65,536 raw patches), when the combined encoded source
+bytes of the retained media exceed the media byte budget, or when a retained item violates
+`--image-resize-policy=error`. A media item that cannot be decoded, parsed, or resized within its
+resource limits returns HTTP 400 `invalid_media`; aggregate trimming never suppresses an item-level
+decoding failure. HTTP 413 `request_too_large` is reserved for a raw request body that exceeds
+`--max-request-mib` before JSON parsing; it is not used for model-context or media resource errors.
 
 ## OpenAI prompt caching
 
@@ -490,23 +512,25 @@ wire response contains typed `output` Items.
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
 | `client_metadata` | Codex client extension; an object or `null`, accepted as opaque tracing metadata with no generation effect |
 | `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
+| `reasoning.summary`, `reasoning.context`, `reasoning.generate_summary`, `reasoning.mode` | ignored: this Engine returns no reasoning summary or context |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
-| `tools` | direct function definitions or namespace groups containing function definitions; see below |
+| `tools` | direct function definitions or namespace groups containing function definitions; entries of any other type are ignored, and a namespace left without an executable function is dropped; see below |
 | `tool_choice` | `auto`, `none`, or function-only `allowed_tools` with mode `auto`; a namespaced selection carries both `namespace` and `name` |
-| `parallel_tool_calls` | `true` by default; `false` is accepted only when no effective tool is callable |
+| `parallel_tool_calls` | `true` by default; `false` is accepted as a client preference, but a response may still contain more than one call |
 | `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; NInfer does not execute hosted tools |
 | `truncation` | omitted or `disabled`; overlong input fails instead of silently dropping Items |
 | `top_logprobs` | omitted or `0` |
 | `service_tier` | omitted, `auto`, or `default`; the response reports `default` |
 | `background` | omitted or `false` |
-| `include` | omitted or an empty array |
+| `include` | omitted or an empty array; a non-empty array is ignored because this local server stores no additional response fields |
 | `stream_options.include_obfuscation` | optional boolean; accepted as a transport hint, but this local server emits no padding |
 | cache and client hints | `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, and explicit breakpoints follow [OpenAI prompt caching](#openai-prompt-caching); `safety_identifier` and `user` are accepted as client hints |
 
 Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
-with a field-specific 400 error instead of being silently ignored.
+with a field-specific 400 error instead of being silently ignored; the accepted client preferences
+listed above are the exception and report a console warning.
 
 ### Input Item contract
 
@@ -683,7 +707,7 @@ Resource behavior:
 
 | Endpoint | Contract |
 |---|---|
-| `GET /v1/responses/{id}` | returns the stored terminal object, or 404 `response_not_found`; stream recovery and non-empty `include` are rejected rather than ignored |
+| `GET /v1/responses/{id}` | returns the stored terminal object, or 404 `response_not_found`; stream recovery and non-empty `include` are rejected on this endpoint rather than ignored |
 | `DELETE /v1/responses/{id}` | removes public retrieval and returns `response.deleted`; descendant contexts already retained by other Responses remain usable |
 | `GET /v1/responses/{id}/input_items` | returns normalized Items supplied to that request; supports `after`, `limit` `1..100` (default `20`), and `order` `asc|desc` (default `desc`); image URLs are redacted unless `include=message.input_image.image_url` |
 | `POST /v1/responses/{id}/cancel` | explicitly fails because background execution is unsupported |
@@ -713,9 +737,10 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 ```
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
-moderation, Structured Outputs/JSON mode, non-empty `include`, background execution, compaction,
-files/audio, and OpenAI-hosted/MCP/custom tools. These are compatibility boundaries, not silently
-accepted placeholders.
+moderation, Structured Outputs/JSON mode, background execution, compaction, files/audio, and
+hosted-MCP connector attachment. These are compatibility boundaries, not silently accepted
+placeholders. Hosted tool types inside `tools[]` are the exception: they are ignored with a console
+warning because the request stays executable without them.
 
 ## Anthropic Messages
 

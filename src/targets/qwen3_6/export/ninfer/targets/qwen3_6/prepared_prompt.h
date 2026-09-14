@@ -125,6 +125,8 @@ struct PrepareStats {
     double media_preprocess_work_seconds = 0.0;
     double tokenize_seconds              = 0.0;
     std::size_t media_items              = 0;
+    // Media items dropped by the aggregate-budget trim, newest media retained.
+    std::size_t media_items_dropped      = 0;
     std::size_t media_bytes              = 0;
     std::uint64_t raw_patches            = 0;
     std::uint64_t vision_tokens          = 0;

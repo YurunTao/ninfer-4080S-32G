@@ -1033,11 +1033,37 @@ def _vision_disabled(context: CaseContext, corpus: Corpus) -> None:
 
 
 def _vision_envelope_over(context: CaseContext, corpus: Corpus) -> None:
+    # 33 x 1024-token images exceed the 32768-token Vision envelope; the server trims
+    # the oldest image so the request still succeeds with the newest 32 retained.
     request = context.start(
         "request",
         chat_request(context.model, corpus.media_messages("many-image-33"), 32),
     )
-    _expect_rejection(context, request, 400, "media_budget_exceeded")
+    context.require_success(request)
+    entry = context.request_log_entry(media_item_count=33, poll_seconds=30.0)
+    if entry is None:
+        context.require(
+            False,
+            "request log recorded the 33-image preparation",
+            "no request_start entry; trim evidence unavailable",
+        )
+        return
+    preparation = entry.get("preparation_seconds") or {}
+    context.require(
+        preparation.get("media_items") == 32,
+        "preparation retained the newest 32 images within the 32768-token envelope",
+        f"media_items={preparation.get('media_items')}",
+    )
+    context.require(
+        preparation.get("media_items_dropped") == 1,
+        "the oldest image was dropped to satisfy the envelope",
+        f"media_items_dropped={preparation.get('media_items_dropped')}",
+    )
+    context.require(
+        preparation.get("vision_tokens") == 32768,
+        "retained media fill the envelope exactly",
+        f"vision_tokens={preparation.get('vision_tokens')}",
+    )
 
 
 def _definition(
@@ -1118,7 +1144,7 @@ _DEFINITIONS = (
     _definition("media-during-text-decode", "openai_chat", "vision-concurrent", "media", ("holder-4096", "many-image-28-a"), "Heavy media arrival during text decode.", _media_during_text_decode),
     _definition("two-heavy-media-arrivals", "openai_chat", "vision-concurrent", "media", ("many-image-28-a", "many-image-28-b"), "Two byte-distinct legal high-media arrivals.", _two_heavy_media, symmetric_role_groups=(SymmetricRoleGroup("media", ("media-a", "media-b")),)),
     _definition("vision-disabled", "openai_chat", "text-cold-8k", "rejection", ("image-chart",), "Media on a text-only Serve is rejected.", _vision_disabled),
-    _definition("vision-envelope-over", "openai_chat", "vision-boundary", "rejection", ("many-image-33",), "Aggregate Vision envelope rejection.", _vision_envelope_over),
+    _definition("vision-envelope-over", "openai_chat", "vision-boundary", "media", ("many-image-33",), "33 images exceed the 32768-token envelope; the oldest is dropped and the request succeeds with the newest 32 retained.", _vision_envelope_over),
 )
 
 

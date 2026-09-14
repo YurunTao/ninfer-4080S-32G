@@ -287,6 +287,7 @@ def _runner_command(
     definition: CaseDefinition,
     raw_path: Path,
     request_timeout: float,
+    request_log: Path,
 ) -> list[str]:
     return [
         sys.executable,
@@ -299,6 +300,8 @@ def _runner_command(
         definition.profile,
         "--timeout-seconds",
         str(request_timeout),
+        "--request-log",
+        str(request_log),
         "--output",
         str(raw_path),
     ]
@@ -438,7 +441,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         definition.profile, runtime_weights, request_log_jsonl
                     ),
                     "runner_command": _runner_command(
-                        definition, raw_path, args.request_timeout_seconds
+                        definition, raw_path, args.request_timeout_seconds, request_log_jsonl
                     ),
                 }
             )

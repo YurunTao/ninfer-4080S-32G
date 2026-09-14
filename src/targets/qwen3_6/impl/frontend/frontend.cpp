@@ -1028,6 +1028,7 @@ PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
         .media_preprocess_work_seconds = stats.media_preprocess_work_seconds,
         .tokenize_seconds              = stats.tokenize_seconds,
         .media_items                   = stats.media_items,
+        .media_items_dropped           = stats.media_items_dropped,
         .media_bytes                   = stats.media_bytes,
         .raw_patches                   = stats.raw_patches,
         .vision_tokens                 = stats.vision_tokens,
@@ -1451,6 +1452,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             result.vision_items.push_back(convert_vision_item(std::move(item)));
         }
         result.prepare.media_items              = processed.stats.media_items;
+        result.prepare.media_items_dropped      = processed.stats.media_items_dropped;
         result.prepare.media_bytes              = processed.stats.media_bytes;
         result.prepare.raw_patches              = processed.stats.raw_patches;
         result.prepare.vision_tokens            = processed.stats.vision_tokens;

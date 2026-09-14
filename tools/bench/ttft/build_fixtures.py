@@ -653,7 +653,9 @@ def check() -> None:
         if media["encoded_media_bytes"] >= 256 * 1024 * 1024:
             raise RuntimeError(f"{name} exceeds the media byte envelope")
     if manifest["media"]["many-image-33"]["vision_tokens"] <= VISION_TOKEN_LIMIT:
-        raise RuntimeError("33-image rejection fixture does not exceed the Vision envelope")
+        raise RuntimeError(
+            "33-image fixture does not exceed the Vision envelope, so it cannot audit the trim"
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

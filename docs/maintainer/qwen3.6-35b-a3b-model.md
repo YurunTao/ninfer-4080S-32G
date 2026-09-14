@@ -817,7 +817,8 @@ Text, MTP, DFlash, and Vision phase capacities from the configured finite execut
 workspace preserves a general execution prefix while a Vision item output is live; before that
 output is produced, Vision encode may reuse the complete backing according to checked
 patch/position, attention, MLP, and merger lifetimes. The registered Frontend retains an aggregate
-prompt budget of `min(max_context,32768)` Vision tokens, while the sequential Vision tower and
+prompt budget of `min(max_context,32768)` Vision tokens, trimming a request whose combined media
+exceeds it to the newest media that fits before preparation, while the sequential Vision tower and
 `[2048,V]` handoff use the registered single-item bound `V<=min(max_context,16384)`. Multiple items
 reuse the same handoff after the previous scatter span is complete. DFlash target features and
 positions survive between target verification and proposal/context publication, so their prefill

@@ -138,6 +138,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--timeout-seconds", type=float, default=600.0)
     parser.add_argument("--api-key-env", default="NINFER_API_KEY")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--request-log",
+        type=Path,
+        default=None,
+        help="Serve --request-log-jsonl path the case may consult for server-side records",
+    )
     args = parser.parse_args(argv)
     if args.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
@@ -170,7 +176,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             progress.event("model.discover", base_url=args.base_url.rstrip("/"))
             model = client.discover_model()
             progress.event("model.ready", model=model)
-            context = CaseContext(client, model, args.timeout_seconds, progress.emit)
+            context = CaseContext(
+                client, model, args.timeout_seconds, progress.emit, args.request_log
+            )
             progress.event("case.graph_start", description=definition.description)
             result = run_case(definition, context, corpus, args.profile_label)
             result["server"] = {"base_url": args.base_url.rstrip("/"), "model": model}

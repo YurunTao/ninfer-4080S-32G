@@ -311,7 +311,7 @@ ninfer::PromptInput image_input() {
     return input;
 }
 
-bool near(float actual, float expected) { return std::abs(actual - expected) < 1.0e-6F; }
+bool close_enough(float actual, float expected) { return std::abs(actual - expected) < 1.0e-6F; }
 
 constexpr std::array<std::uint8_t, 32> kGradientDigest{
     0x1e, 0x8c, 0xd9, 0x22, 0x40, 0xfa, 0x10, 0x62, 0x7b, 0x60, 0x86, 0x8e, 0xe9, 0x66, 0x41, 0xa2,
@@ -1470,24 +1470,131 @@ int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
                                     data.vision_items.size() == kMediaItems,
                                 "frontend retained an item-count admission limit");
 
-    fi::ProcessorOptions options;
-    options.max_encoded_media_bytes = bytes.size() * 2 - 1;
+    fi::ProcessorOptions trim_options;
+    trim_options.max_encoded_media_bytes = bytes.size() * 2 - 1;
     auto cache = std::make_shared<fi::MediaPreprocessCache>(ninfer::kDefaultMediaCacheBytes,
                                                             ninfer::kDefaultMediaLiveBytes);
-    fi::Processor processor(fixture_tokenizer(), thinking_toggle_template(), options,
-                            std::move(cache));
-    fi::ChatMessage internal_message;
-    internal_message.role = ninfer::ChatRole::User;
+    fi::Processor trim_processor(fixture_tokenizer(), thinking_toggle_template(), trim_options,
+                                 std::move(cache));
+    fi::ChatMessage trimmed_message;
+    trimmed_message.role = ninfer::ChatRole::User;
     for (std::size_t index = 0; index < 2; ++index) {
-        internal_message.parts.push_back(
+        trimmed_message.parts.push_back(
+            fi::ChatPart::image(fi::MediaData{.bytes       = bytes,
+                                              .media_type  = "image/x-portable-pixmap",
+                                              .source_name = "byte-budget.ppm"}));
+    }
+    const fi::ProcessedInput trimmed =
+        trim_processor.process(std::vector<fi::ChatMessage>{trimmed_message});
+    failures += check(trimmed.stats.media_items == 1 &&
+                          trimmed.stats.media_items_dropped == 1 &&
+                          trimmed.stats.media_bytes == bytes.size() &&
+                          trimmed.vision_items.size() == 1,
+                      "processor did not trim the oldest media to the encoded-media byte budget");
+
+    fi::ProcessorOptions tight_options;
+    tight_options.max_encoded_media_bytes = bytes.size() - 1;
+    auto tight_cache = std::make_shared<fi::MediaPreprocessCache>(
+        ninfer::kDefaultMediaCacheBytes, ninfer::kDefaultMediaLiveBytes);
+    fi::Processor tight_processor(fixture_tokenizer(), thinking_toggle_template(), tight_options,
+                                  std::move(tight_cache));
+    fi::ChatMessage tight_message;
+    tight_message.role = ninfer::ChatRole::User;
+    for (std::size_t index = 0; index < 2; ++index) {
+        tight_message.parts.push_back(
             fi::ChatPart::image(fi::MediaData{.bytes       = bytes,
                                               .media_type  = "image/x-portable-pixmap",
                                               .source_name = "byte-budget.ppm"}));
     }
     failures += check(throws_processor_budget([&] {
-                          (void)processor.process(std::vector<fi::ChatMessage>{internal_message});
+                          (void)tight_processor.process(std::vector<fi::ChatMessage>{
+                              tight_message});
                       }),
-                      "processor did not enforce the aggregate encoded-media byte budget");
+                      "processor did not reject when even the newest media item exceeds the "
+                      "encoded-media byte budget");
+    return failures;
+}
+
+int test_media_budget_trims_oldest_media() {
+    // Each 64x64 probe is 16 raw patches / 4 vision tokens; the 128x128 probe is 64/16.
+    const std::vector<std::uint8_t> first = block_ppm(64, 64, 1);
+    const std::vector<std::uint8_t> large = block_ppm(128, 128, 7);
+    const std::vector<std::uint8_t> third = block_ppm(64, 64, 2);
+    const std::vector<std::uint8_t> last  = block_ppm(64, 64, 3);
+    const std::vector<std::vector<std::uint8_t>> probes = {first, large, third, last};
+
+    fi::ProcessorOptions options;
+    options.max_vision_tokens = 24;                 // large + two small probes, not all four.
+    options.max_raw_patches   =
+        24U * ninfer::targets::qwen3_6::kRawPatchesPerVisionToken;
+    auto cache = std::make_shared<fi::MediaPreprocessCache>(ninfer::kDefaultMediaCacheBytes,
+                                                            ninfer::kDefaultMediaLiveBytes);
+    fi::Processor processor(fixture_tokenizer(), thinking_toggle_template(), options,
+                            std::move(cache));
+
+    auto build_messages = [&]() {
+        std::vector<fi::ChatMessage> messages;
+        fi::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        // Real chat content interleaves text with media, so part indices and media-part
+        // indices differ; the trim must erase by media-part index.
+        for (std::size_t index = 0; index < probes.size(); ++index) {
+            message.parts.push_back(fi::ChatPart::text_part("probe " + std::to_string(index)));
+            message.parts.push_back(fi::ChatPart::image(fi::MediaData{
+                .bytes       = probes[index],
+                .media_type  = "image/x-portable-pixmap",
+                .source_name = "trim.ppm"}));
+        }
+        messages.push_back(std::move(message));
+        return messages;
+    };
+
+    const std::size_t counted = processor.count_tokens(build_messages());
+    const fi::ProcessedInput processed = processor.process(build_messages());
+    const fi::PreprocessStats& stats   = processed.stats;
+
+    int failures = check(stats.media_items == 3 && stats.media_items_dropped == 1 &&
+                             stats.vision_tokens == 24 && stats.raw_patches == 96 &&
+                             processed.vision_items.size() == 3,
+                         "aggregate budget trim did not retain exactly the newest fitting media");
+    const std::vector<fi::Sha256Digest> expected_digests = {
+        fi::sha256(std::span<const std::uint8_t>(large)),
+        fi::sha256(std::span<const std::uint8_t>(third)),
+        fi::sha256(std::span<const std::uint8_t>(last)),
+    };
+    failures += check(std::equal(expected_digests.begin(), expected_digests.end(),
+                                 processed.vision_items.begin(),
+                                 [](const fi::Sha256Digest& expected,
+                                    const fi::VisionItem& item) {
+                                     return expected == item.content_digest;
+                                 }),
+                      "trim retained an unexpected media item instead of the newest three");
+    failures += check(counted == processed.stats.prompt_tokens,
+                      "token counting and preparation disagree on the trimmed media");
+
+    // One probe at the fixed per-item Vision capacity is still admitted.
+    const std::vector<std::uint8_t> at_capacity = block_ppm(4096, 4096, 9);
+    fi::ProcessorOptions capacity_options;
+    capacity_options.image_min_pixels = 4096ULL;
+    capacity_options.image_max_pixels = 16'777'216ULL;
+    auto capacity_cache = std::make_shared<fi::MediaPreprocessCache>(
+        ninfer::kDefaultMediaCacheBytes, ninfer::kDefaultMediaLiveBytes);
+    fi::Processor capacity_processor(fixture_tokenizer(), thinking_toggle_template(),
+                                     capacity_options, std::move(capacity_cache));
+    std::vector<fi::ChatMessage> capacity_messages;
+    fi::ChatMessage capacity_message;
+    capacity_message.role = ninfer::ChatRole::User;
+    capacity_message.parts.push_back(fi::ChatPart::image(fi::MediaData{
+        .bytes       = at_capacity,
+        .media_type  = "image/x-portable-pixmap",
+        .source_name = "at-capacity.ppm"}));
+    capacity_messages.push_back(std::move(capacity_message));
+    const fi::ProcessedInput capacity_processed = capacity_processor.process(
+        std::move(capacity_messages));
+    failures += check(capacity_processed.stats.vision_tokens ==
+                          ninfer::targets::qwen3_6::kMaximumVisionItemTokens &&
+                          capacity_processed.stats.media_items_dropped == 0,
+                      "single media item at the per-item Vision capacity was trimmed or rejected");
     return failures;
 }
 
@@ -2068,7 +2175,7 @@ int test_media_payload_outlives_frontend_cache() {
     const auto& data = FrontendFactory::inspect(survivor);
     return check(data.media_payloads.size() == 1 && data.media_payloads.front() &&
                      data.media_payloads.front()->patch_elements == 16 * 1536 &&
-                     near(bf16_value(data.media_payloads.front()->span().front()), -1.0F),
+                     close_enough(bf16_value(data.media_payloads.front()->span().front()), -1.0F),
                  "request-pinned media payload did not survive its Frontend cache owner");
 }
 
@@ -2237,6 +2344,7 @@ int main() {
     failures += test_image_resize_rejection_policy();
     failures += test_explicit_leading_instruction_cache_boundary();
     failures += test_media_admission_uses_aggregate_resources(frontend);
+    failures += test_media_budget_trims_oldest_media();
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
     failures += test_attention_pairs_are_diagnostic(frontend);
     failures += test_video_prepare(frontend);

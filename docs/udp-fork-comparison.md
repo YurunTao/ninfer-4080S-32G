@@ -125,7 +125,9 @@ green 84/84 suite on their side. Disposition per group:
   request with 8K-32K image tokens passes the budget check and reaches the
   undersized encoder. This fork wires the budget to the same limit
   (`fix(frontend)` follow-up commit), so the failure is a clean
-  `media_budget_exceeded`. With the port, `rk4v4-e8` serves the full native
+  `media_budget_exceeded`. (Later, aggregate trimming made an oversized request drop its oldest
+  media instead of failing whenever the newest item alone fits the limit.) With the port,
+  `rk4v4-e8` serves the full native
   262,144 context with `--vision` at 780 MiB slack - the 208K practical line and
   the vision-against-context tradeoff are gone.
 - **CUDA-graph allowance tightening (c85db47a): skipped.** They replace their old

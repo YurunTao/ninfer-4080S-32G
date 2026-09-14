@@ -141,11 +141,11 @@ checkpoint capacity beyond active lanes.
 | `lane-limit-8` | `--max-context 4224 --kv-capacity 33792 --max-concurrency 8 --max-pending-requests 1 --pending-timeout-ms 120000 --no-prefix-reuse` |
 | `pending-timeout` | `--max-context 4224 --kv-capacity 4224 --max-concurrency 1 --max-pending-requests 1 --pending-timeout-ms 100 --no-prefix-reuse` |
 | `context-boundary` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 1 --no-prefix-reuse` |
-| `vision-cache` | `--max-context 32768 --kv-capacity 32768 --max-concurrency 1 --device-state-slots 2 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 2 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0 --vision --media-cache-mib 512 --media-live-mib 512` |
-| `vision-thread-1` | `--max-context 32768 --kv-capacity 32768 --max-concurrency 1 --device-state-slots 2 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 2 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0 --vision --media-cache-mib 512 --media-live-mib 512 --media-preprocess-threads 1` |
-| `vision-concurrent` | `--max-context 32768 --kv-capacity 65536 --max-concurrency 2 --vision --media-cache-mib 512 --media-live-mib 1024 --no-prefix-reuse` |
+| `vision-cache` | `--max-context 32768 --kv-capacity 32768 --max-concurrency 1 --device-state-slots 2 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 2 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0 --vision --vision-max-tokens 32768 --media-cache-mib 512 --media-live-mib 512` |
+| `vision-thread-1` | `--max-context 32768 --kv-capacity 32768 --max-concurrency 1 --device-state-slots 2 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 2 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0 --vision --vision-max-tokens 32768 --media-cache-mib 512 --media-live-mib 512 --media-preprocess-threads 1` |
+| `vision-concurrent` | `--max-context 32768 --kv-capacity 65536 --max-concurrency 2 --vision --vision-max-tokens 32768 --media-cache-mib 512 --media-live-mib 1024 --no-prefix-reuse` |
 | `media-cache-tight` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 1 --vision --media-cache-mib 16 --media-live-mib 128 --no-prefix-reuse` |
-| `vision-boundary` | `--max-context 65536 --kv-capacity 65536 --max-concurrency 1 --vision --no-prefix-reuse` |
+| `vision-boundary` | `--max-context 65536 --kv-capacity 65536 --max-concurrency 1 --vision --vision-max-tokens 32768 --no-prefix-reuse` |
 | `mixed-four` | `--max-context 8192 --kv-capacity 32768 --max-concurrency 4 --vision` |
 
 ## Audited cases
@@ -218,7 +218,7 @@ Media cases:
 | `media-during-text-decode` | `vision-concurrent` | Heavy media request arrives while a text holder decodes. |
 | `two-heavy-media-arrivals` | `vision-concurrent` | Two byte-distinct 28-image requests start through one barrier. |
 | `vision-disabled` | `text-cold-8k` | Image request is 400 `vision_disabled`. |
-| `vision-envelope-over` | `vision-boundary` | 33 images exceed the 32768 raw-patch envelope and return `media_budget_exceeded`. |
+| `vision-envelope-over` | `vision-boundary` | 33 images exceed the 32768-token Vision envelope; the oldest image is trimmed and the request succeeds with the newest 32 retained (verified through the server request log). |
 
 The protected-head profile uses:
 

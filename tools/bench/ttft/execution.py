@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from tools.ninfer_serve.client import (
@@ -427,11 +429,13 @@ class CaseContext:
         model: str,
         timeout_seconds: float,
         on_progress: ProgressCallback | None = None,
+        request_log_path: Path | None = None,
     ) -> None:
         self.client = client
         self.model = model
         self.timeout = timeout_seconds
         self._on_progress = on_progress
+        self.request_log_path = request_log_path
         self.handles: list[RequestHandle] = []
         self.failures: list[FailedCondition] = []
         self.notes: dict[str, Any] = {}
@@ -439,6 +443,60 @@ class CaseContext:
     def progress(self, stage: str, **fields: Any) -> None:
         if self._on_progress is not None:
             self._on_progress(stage, time.perf_counter_ns(), fields)
+
+    def request_log_entry(
+        self,
+        *,
+        media_item_count: int | None = None,
+        poll_seconds: float | None = None,
+    ) -> dict[str, Any] | None:
+        """The server request-log `request_start` record for one request, if logged.
+
+        The Serve request log records the preparation statistics (including
+        `preparation_seconds.media_items_dropped` for the aggregate Vision trim) only
+        after request preparation, before generation. Returns None when no request log
+        is wired for this run; `poll_seconds` bounds the wait for the flushed line.
+        """
+        if self.request_log_path is None:
+            return None
+        deadline = time.monotonic() + max(0.0, poll_seconds) if poll_seconds is not None else None
+        while True:
+            entry = self._read_request_log_entry(media_item_count)
+            if entry is not None or deadline is None or time.monotonic() >= deadline:
+                return entry
+            time.sleep(min(0.25, max(0.05, deadline - time.monotonic())))
+
+    def _read_request_log_entry(
+        self, media_item_count: int | None
+    ) -> dict[str, Any] | None:
+        path = self.request_log_path
+        if path is None or not path.is_file():
+            return None
+        entry: dict[str, Any] | None = None
+        try:
+            with path.open("r", encoding="utf-8") as stream:
+                for line in stream:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(record, dict) or record.get("event") != "request_start":
+                        continue
+                    request = record.get("request")
+                    if not isinstance(request, dict):
+                        continue
+                    if (
+                        media_item_count is not None
+                        and request.get("media_item_count") != media_item_count
+                    ):
+                        continue
+                    entry = record
+        except OSError:
+            return None
+        return entry
 
     def prepare(self, role: str, request: ProtocolRequest) -> RequestHandle:
         order = len(self.handles)

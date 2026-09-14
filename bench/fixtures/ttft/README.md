@@ -17,7 +17,8 @@ The generated media consists of 56 deterministic, byte-distinct 1024×1024 PNGs.
 heavy inputs use disjoint sets of 28 images each. Every image expands to a 12 MiB Vision
 preprocessing patch tensor (this is media payload, not KV storage), so the files exercise media
 live-byte and preprocess-cache policy without creating large HTTP bodies. The 33-image input is an
-intentional aggregate Vision-envelope rejection.
+intentional aggregate Vision-envelope overflow that audits the oldest-media trim (the request
+succeeds with the newest 32 images retained).
 
 Regenerate only when a case contract changes, using a local tokenizer checkout:
 

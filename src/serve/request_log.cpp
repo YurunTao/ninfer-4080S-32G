@@ -255,6 +255,7 @@ Json preparation_json(const RequestLogContext& context) {
                 {"media_preprocess_work", stats.media_preprocess_work_seconds},
                 {"tokenize", stats.tokenize_seconds},
                 {"media_items", stats.media_items},
+                {"media_items_dropped", stats.media_items_dropped},
                 {"media_bytes", stats.media_bytes},
                 {"raw_patches", stats.raw_patches},
                 {"vision_tokens", stats.vision_tokens},
