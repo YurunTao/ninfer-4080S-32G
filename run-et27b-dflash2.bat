@@ -3,13 +3,15 @@ setlocal
 
 rem =====================================================================
 rem  ninfer-serve launcher - NInfer-4080S-32G, ET27B DFlash2 K=7 profile
+rem  240K context (245760), 4-bit KV cache (rk4v4-e8), 2 concurrent requests
 rem
 rem  Windows equivalent of the Linux command:
 rem    ./build-sm89/apps/ninfer-serve out/et27b_dflash2.ninfer \
 rem      --host 127.0.0.1 --port 9527 \
-rem      --max-context 245760 --kv-capacity 245760 --kv-dtype int8 \
+rem      --max-context 245760 --kv-capacity 245760 --kv-dtype rk4v4-e8 \
 rem      --spec dflash2 --draft-tokens 7 --lm-head-draft \
-rem      --preserve-thinking --max-concurrency 4 --vision \
+rem      --preserve-thinking --max-concurrency 2 --vision \
+rem      --vision-max-tokens 32768 \
 rem      --slot-save-path /home/raymond/ninfer-sessions \
 rem      --session-auto-restore --auto-save-on-stop \
 rem      --max-snapshot-disk-gib 100 --checkpoint-interval 16384
@@ -50,7 +52,7 @@ rem ---- on-disk session store ------------------------------------------
 set "SESSIONS=%ROOT%ninfer-sessions"
 if not exist "%SESSIONS%" mkdir "%SESSIONS%"
 
-echo Starting ninfer-serve - ET27B DFlash2 K=7 at http://127.0.0.1:9527/v1
+echo Starting ninfer-serve - ET27B DFlash2 K=7, 240K ctx, rk4v4-e8 KV, 2 concurrent at http://127.0.0.1:9527/v1
 echo   Server : %SERVER%
 echo   Model  : %MODEL%
 echo   Sessions: %SESSIONS%
@@ -58,9 +60,10 @@ echo Press Ctrl+C to stop - sessions are flushed on clean shutdown.
 
 "%SERVER%" "%MODEL%" ^
   --host 127.0.0.1 --port 9527 ^
-  --max-context 245760 --kv-capacity 245760 --kv-dtype int8 ^
+  --max-context 245760 --kv-capacity 245760 --kv-dtype rk4v4-e8 ^
   --spec dflash2 --draft-tokens 7 --lm-head-draft ^
-  --preserve-thinking --max-concurrency 4 --vision ^
+  --preserve-thinking --max-concurrency 2 --vision ^
+  --vision-max-tokens 32768 ^
   --slot-save-path "%SESSIONS%" ^
   --session-auto-restore --auto-save-on-stop ^
   --max-snapshot-disk-gib 100 --checkpoint-interval 16384
