@@ -140,6 +140,11 @@ INT8 与 E8 档位在本卡上解码侧表现一致的原因。
   让 request plan 为长 prompt 周期性提供 `LongAnchor` 候选，于是"改写 prompt 中段"不再只能
   回退到本轮起点。候选只扩大集合，保留数量仍受 `--max-long-anchors-per-continuation`
   约束；落在视觉 token 跨度内的前沿会被跳过。
+- **媒体预算自动裁剪**（`2ea394b6`）。多模态请求超出聚合视觉预算时不再直接 400，改为**丢弃最旧
+  的媒体、保留最新的能放下的部分**，只有最新一项自身就超预算、保留项超单项上限或违反
+  `--image-resize-policy=error` 时才仍报 `media_budget_exceeded`。丢弃条数写进 Serve 请求日志，
+  文档、前端测试与 TTFT bench 用例同步更新；Windows 启动脚本统一带 `--vision-max-tokens 32768`
+  （`7567ddb7`），吃满注册的 32768 合并 token 上限。
 
 从 4090 fork 继承（本分支原样携带）：`sm_89` retarget 与 INT8 注意力 prefill 的 Ada
 重调、causal-tile 分区 key-block 遍历、`/v1/models` 的 `context_window` 字段、
@@ -186,10 +191,21 @@ DFlash2 工件由本仓库 `tools/reference` 的 Python 转换器生成（需要
   --max-context 262144 --kv-capacity 262144 --kv-dtype int8 \
   --spec dflash2 --draft-tokens 7 --lm-head-draft \
   --preserve-thinking --max-concurrency 4 --vision \
+  --vision-max-tokens 32768 \
   --slot-save-path /opt/ai/snapshots \
   --session-auto-restore --auto-save-on-stop \
   --max-snapshot-disk-gib 20 --checkpoint-interval 16384
 ```
+
+视觉上限是 `min(--max-context, 32768, --vision-max-tokens)`。`--vision-max-tokens` 的 Serve 默认
+值只有 8192（约 8 张 1024×1024 图，每张 1024 合并 token），要吃到注册的 32768 合并 token
+（131072 raw patch）上限就得显式给 32768——本仓库的视觉启动脚本都这么设。加进来多少都不再因为
+"超预算"失败：请求的多媒体总量超过聚合预算时，服务**丢弃最旧的媒体、保留最新的能放下的部分**
+（聚合 raw patch / 视觉 token / 编码字节三个预算，按消息顺序，响应 schema 不变；保留与丢弃的
+条数写进 Serve 请求日志 `request_start` 记录里的 `media_items` / `media_items_dropped`）。只有
+最新一项自身就超预算、保留项超单项上限（16384 合并 token / 65536 raw patch）、或保留项违反
+`--image-resize-policy=error` 时才仍返回 400 `media_budget_exceeded`；单项解码或解析失败仍然
+是 400 `invalid_media`，裁剪不会掩盖它。
 
 `--slot-save-path` 一旦设置，该目录即成为磁盘会话存储：启动时索引既有侧车，驱逐的会话落盘为
 write-once 快照。`--session-auto-restore` 是"重启后自动接续上次会话"的开关；MTP 档位下还能
