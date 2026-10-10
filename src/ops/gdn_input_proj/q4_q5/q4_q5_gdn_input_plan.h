@@ -1,6 +1,8 @@
 #pragma once
 
-#include "core/weight.h"
+#include "ninfer/ops/linear.h"
+
+#include "core/arena.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
@@ -12,9 +14,8 @@ namespace ninfer::ops::detail {
 
 enum class Q4Q5GdnInputScheduleId {
     IndependentDirectFixed,
-    GroupedMixedMmaR32C32S2,
-    GroupedMixedMmaR32C64S4,
-    GroupedMixedMmaR64C128S2,
+    GroupedMixedMmaR64C128,
+    Int8Jobs,
 };
 
 enum class Q4Q5GdnInputConvScheduleId {
@@ -34,6 +35,7 @@ struct Q4Q5GdnInputProblem {
 
 struct Q4Q5GdnInputPlan {
     Q4Q5GdnInputScheduleId schedule;
+    std::size_t workspace_bytes;
 };
 
 struct Q4Q5GdnInputConvPlan {
@@ -44,15 +46,20 @@ const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexc
 const char* q4_q5_gdn_input_conv_schedule_name(Q4Q5GdnInputConvScheduleId schedule) noexcept;
 
 bool q4_q5_gdn_input_admits(const Q4Q5GdnInputProblem& problem) noexcept;
-Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem);
+Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem,
+                                              LinearPolicy policy);
+
+std::size_t q4_q5_gdn_input_capacity_workspace_bytes(std::int32_t min_tokens,
+                                                     std::int32_t max_tokens, LinearPolicy policy);
 Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem& problem,
                                                        std::int32_t batch_size);
 
 void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
                                   const Weight& qk_weight, const Weight& value_z_weight,
-                                  Tensor& qkv, Tensor& z, cudaStream_t stream);
+                                  Tensor& qkv, Tensor& z, WorkspaceArena* ws, LinearPolicy policy,
+                                  cudaStream_t stream);
 void q4_q5_gdn_input_dispatch(const Tensor& x, const Weight& qk_weight,
                               const Weight& value_z_weight, Tensor& qkv, Tensor& z,
-                              cudaStream_t stream);
+                              WorkspaceArena* ws, LinearPolicy policy, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

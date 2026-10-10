@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <initializer_list>
 #include <iostream>
 #include <memory>
@@ -752,6 +753,281 @@ int test_free_tool_continuation() {
 
 } // namespace
 
+std::string first_argument(const fi::ParsedToolCallOutput& parsed, const std::string& key) {
+    if (parsed.tool_calls.size() != 1) { return "<no single call>"; }
+    const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+    return args.contains(key) ? args.at(key).get<std::string>() : "<missing>";
+}
+
+int test_tolerant_recovers_unrepresentable_delimiters() {
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::string unmatched_open =
+        tool_call("bash", {{"command", "echo '<parameter=unterminated>'"}});
+    const std::string standalone_close = tool_call("bash", {{"command", "echo '</parameter>'"}});
+
+    int failures = 0;
+    for (const auto& [text, value] :
+         {std::pair{unmatched_open, std::string("echo '<parameter=unterminated>'")},
+          std::pair{standalone_close, std::string("echo '</parameter>'")}}) {
+        const auto strict = fi::parse_qwen_tool_call_output(text, 64, contract);
+        failures += check(!strict.is_tool_call_response, "strict mode changed: " + value);
+        const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract, true);
+        failures += check(parsed.is_tool_call_response, "tolerant mode did not recover: " + value);
+        failures += check(first_argument(parsed, "command") == value,
+                          "tolerant mode recovered the wrong value: " + value);
+        failures += check(parsed.diagnostics.recovered_from ==
+                              ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                          "recovery was not recorded: " + value);
+        failures += check(parsed.content.empty(), "recovery leaked content: " + value);
+    }
+    return failures;
+}
+
+int test_tolerant_multi_parameter_value_quoting_close() {
+    const auto contract =
+        contract_for("write_file", Json{{"path", Json{{"type", "string"}}},
+                                        {"content", Json{{"type", "string"}}},
+                                        {"overwrite", Json{{"type", "boolean"}}}});
+    const std::string body = "assert parse('</parameter>') is None\n";
+    const std::string text =
+        tool_call("write_file", {{"path", "tests/t.py"}, {"content", body}, {"overwrite", "true"}});
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract, true);
+
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "multi-parameter call was not recovered");
+    if (parsed.tool_calls.size() != 1) { return failures; }
+    const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+    failures += check(args.at("path") == "tests/t.py", "path was mis-split");
+    failures +=
+        check(args.at("content").get<std::string>().find("'</parameter>'") != std::string::npos,
+              "content lost the quoted close");
+    failures += check(args.at("overwrite") == true, "boolean after recovered value was mistyped");
+    return failures;
+}
+
+int test_tolerant_prose_around_calls() {
+    const auto contract        = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::string call     = tool_call("bash", {{"command", "ls"}});
+    const std::string quoted   = "Qwen wraps calls in <tool_call> tags. Running it now.\n" + call;
+    const std::string trailing = call + "\nDone, that lists the directory.";
+
+    int failures             = 0;
+    const auto strict_quoted = fi::parse_qwen_tool_call_output(quoted, 64, contract);
+    failures +=
+        check(!strict_quoted.is_tool_call_response, "strict mode changed for quoted marker");
+    const auto q = fi::parse_qwen_tool_call_output(quoted, 64, contract, true);
+    failures += check(q.is_tool_call_response && first_argument(q, "command") == "ls",
+                      "call after a quoted marker was not recovered");
+    failures += check(q.content == "Qwen wraps calls in <tool_call> tags. Running it now.",
+                      "prose before the call was not kept as content: " + q.content);
+
+    const auto strict_trailing = fi::parse_qwen_tool_call_output(trailing, 64, contract);
+    failures += check(strict_trailing.diagnostics.fallback_reason ==
+                          ninfer::ToolCallParseFallbackReason::TrailingContent,
+                      "strict mode changed for trailing prose");
+    const auto t = fi::parse_qwen_tool_call_output(trailing, 64, contract, true);
+    failures += check(t.is_tool_call_response && first_argument(t, "command") == "ls",
+                      "call before trailing prose was not recovered");
+    failures += check(t.content == "Done, that lists the directory.",
+                      "trailing prose was not kept as content: " + t.content);
+    failures +=
+        check(t.diagnostics.recovered_from == ninfer::ToolCallParseFallbackReason::TrailingContent,
+              "trailing recovery was not recorded");
+    return failures;
+}
+
+int test_tolerant_keeps_unrecoverable_fallback() {
+    const auto contract         = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::string truncated = "<tool_call>\n<function=bash>\n<parameter=command>\nls -la";
+    const auto parsed           = fi::parse_qwen_tool_call_output(truncated, 64, contract, true);
+    int failures                = 0;
+    failures += check(!parsed.is_tool_call_response, "a truncated call was invented");
+    failures += check(parsed.content == truncated, "fallback did not preserve the bytes");
+    return failures;
+}
+
+int test_tolerant_incremental_decoder() {
+    const auto contract = output_contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::string text = "Note: <tool_call> is the marker.\n" +
+                             tool_call("bash", {{"command", "echo '</parameter>'"}}) +
+                             "\nThat is all.";
+    fi::ToolCallOutputDecoder decoder(contract, 64, true);
+    std::string visible;
+    for (std::size_t i = 0; i < text.size(); i += 7) { visible += decoder.feed(text.substr(i, 7)); }
+    const auto terminal = decoder.finish();
+
+    int failures = 0;
+    failures += check(terminal.tool_calls.size() == 1, "decoder did not recover the call");
+    if (terminal.tool_calls.size() == 1) {
+        const Json args = Json::parse(terminal.tool_calls.front().arguments_json);
+        failures +=
+            check(args.at("command") == "echo '</parameter>'", "decoder value was mis-split");
+    }
+    failures +=
+        check(visible + terminal.content == "Note: <tool_call> is the marker.\n\nThat is all.",
+              "decoder content was wrong: " + visible + "|" + terminal.content);
+    return failures;
+}
+
+// Review of PR #14 (sergiuszm): tolerant mode must never run a call the model did not issue.
+int test_tolerant_never_runs_a_quoted_call() {
+    int failures = 0;
+    // 1. An undeclared tool whose value quotes a complete call to a declared one: strict returns
+    //    text, and the retry must not restart inside the failing call's own value.
+    {
+        const auto contract = contract_for("run_shell", Json{{"command", Json{{"type", "string"}}}});
+        const std::string text = tool_call(
+            "write_docs",
+            {{"text", "Example:\n" + tool_call("run_shell", {{"command", "rm -rf build"}})}});
+        const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract, true);
+        failures += check(!parsed.is_tool_call_response && parsed.content == text,
+                          "a call quoted inside a failing call's value was executed");
+    }
+    // 2. A call cut off (max_tokens) inside a value that quotes an example call: the example's
+    //    closes must not complete it.
+    {
+        const auto contract =
+            contract_for("write_file", Json{{"path", Json{{"type", "string"}}},
+                                            {"content", Json{{"type", "string"}}}});
+        const std::string text =
+            "<tool_call>\n<function=write_file>\n<parameter=path>\nREADME.md\n</parameter>\n"
+            "<parameter=content>\nUsage:\n" +
+            tool_call("write_file", {{"path", "x"}, {"content", "y"}}) + "\nThe rest of the file";
+        const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract, true);
+        failures += check(!parsed.is_tool_call_response,
+                          "a truncated call was completed with the closes of a quoted example");
+    }
+    // 3. Trailing prose that holds another call: the example must not run in place of the real one.
+    {
+        const auto contract = contract_for("run_shell", Json{{"command", Json{{"type", "string"}}}});
+        const std::string text = "Here is the format: " +
+                                 tool_call("run_shell", {{"command", "echo example"}}) +
+                                 " Now I will run the tests. " +
+                                 tool_call("run_shell", {{"command", "pytest"}});
+        const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract, true);
+        failures += check(!parsed.is_tool_call_response,
+                          "an example call before the real one was executed");
+    }
+    return failures;
+}
+
+// Second review of PR #14 (sergiuszm).
+int test_tolerant_second_review() {
+    int failures = 0;
+    // 1. A malformed outer opener is an opening attempt, not prose: the complete call quoted in its
+    //    value must not run.
+    for (const std::string opener : {"<funtion=write_docs>", "<function =write_docs>"}) {
+        const auto contract = contract_for("run_shell", Json{{"command", Json{{"type", "string"}}}});
+        const std::string text =
+            "<tool_call>\n" + opener + "\n<parameter=text>\nExample:\n" +
+            tool_call("run_shell", {{"command", "rm -rf build"}}) +
+            "\n</parameter>\n</function>\n</tool_call>";
+        const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract, true);
+        failures += check(!parsed.is_tool_call_response && parsed.content == text,
+                          "a call quoted inside a malformed opener ran: " + opener);
+    }
+    // 2. Output cut off by the limit through a value that quotes only the end of a call: no
+    //    recovery once generation stopped on the limit.
+    {
+        const auto output =
+            output_contract_for("write_file", Json{{"path", Json{{"type", "string"}}},
+                                                   {"content", Json{{"type", "string"}}}});
+        const std::string text =
+            "<tool_call>\n<function=write_file>\n<parameter=path>\ndocs/end.md\n</parameter>\n"
+            "<parameter=content>\n# How a call ends\nA call ends with:\n</parameter>\n</function>\n"
+            "</tool_call>\nand then the";
+        for (const bool truncated : {false, true}) {
+            fi::ToolCallOutputDecoder decoder(output, 64, true);
+            const std::string visible = decoder.feed(text);
+            const auto terminal       = decoder.finish(truncated);
+            if (truncated) {
+                failures += check(terminal.tool_calls.empty() && visible + terminal.content == text,
+                                  "a call cut off by the output limit was recovered");
+            } else {
+                failures += check(terminal.tool_calls.size() == 1,
+                                  "control: the same text without the limit should recover");
+            }
+        }
+    }
+    // 3. Cost stays bounded by the attempt budget on long broken output.
+    {
+        const auto contract = contract_for("write_file", Json{{"content", Json{{"type", "string"}}}});
+        std::string text    = "<tool_call>\n<function=write_file>\n<parameter=content>\n";
+        while (text.size() < (1u << 20)) { text += "x\n</parameter>\n<parameter=p>\n"; }
+        const auto begin  = std::chrono::steady_clock::now();
+        const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract, true);
+        const auto ms     = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - begin)
+                            .count();
+        failures += check(!parsed.is_tool_call_response, "1 MB broken output was recovered");
+        failures += check(ms < 1000, "1 MB broken output took " + std::to_string(ms) + " ms");
+    }
+    return failures;
+}
+
+int test_tolerant_quoted_call_end() {
+    const auto contract = contract_for("write_file", Json{{"path", Json{{"type", "string"}}},
+                                                          {"content", Json{{"type", "string"}}}});
+    const std::string body =
+        "# How One of My Tool Calls Ends\nThey end in this exact order:\n\n```\n</parameter>\n"
+        "</function>\n</tool_call>\n```\n\nThe first tag closes the parameter block.";
+    const std::string file_call = "<tool_call>\n<function=write_file>\n<parameter=path>\n"
+                                  "docs/how-calls-end.md\n</parameter>\n<parameter=content>\n" +
+                                  body + "\n</parameter>\n</function>\n</tool_call>";
+    int failures = 0;
+    // A complete call whose file content quotes the three closing tags (real model output): the
+    // quoted end must not cut the file, with the rest going out as trailing content.
+    {
+        const auto parsed = fi::parse_qwen_tool_call_output(file_call, 64, contract, true);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.content.empty(),
+                          "a call quoting its closing tags was split: " + parsed.content);
+        if (parsed.tool_calls.size() == 1) {
+            failures += check(Json::parse(parsed.tool_calls[0].arguments_json).at("content") == body,
+                              "a call quoting its closing tags was truncated");
+        }
+    }
+    // The same when the quoting call is the second of two.
+    {
+        const std::string text = tool_call("write_file", {{"path", "a.md"}, {"content", "a"}}) +
+                                 "\n" + file_call;
+        const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract, true);
+        failures += check(parsed.tool_calls.size() == 2 && parsed.content.empty() &&
+                              Json::parse(parsed.tool_calls[1].arguments_json).at("content") == body,
+                          "the second call quoting its closing tags was truncated");
+    }
+    // A real call followed by prose that names `</tool_call>` falls back, like strict mode.
+    {
+        const std::string text = tool_call("write_file", {{"path", "a.md"}, {"content", "a"}}) +
+                                 "\nEach call ends with </tool_call>.";
+        const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract, true);
+        failures += check(!parsed.is_tool_call_response && parsed.content == text,
+                          "prose naming </tool_call> after a call was recovered");
+    }
+    return failures;
+}
+
+int test_tolerant_trailing_details() {
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::string call = tool_call("bash", {{"command", "ls"}});
+    int failures           = 0;
+    // 6. A stray duplicate close after a complete call is dropped, not shown.
+    const auto dup = fi::parse_qwen_tool_call_output(call + "\n</tool_call>", 64, contract, true);
+    failures += check(dup.is_tool_call_response && dup.tool_calls.size() == 1 && dup.content.empty(),
+                      "a stray </tool_call> became content: " + dup.content);
+    // 5. Streaming: the whitespace held back before the call separates the trailing prose.
+    const auto output = output_contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::string text = "Running the tests.\n" + call + "\nDone, waiting for output.";
+    fi::ToolCallOutputDecoder decoder(output, 64, true);
+    std::string visible;
+    for (std::size_t i = 0; i < text.size(); i += 5) { visible += decoder.feed(text.substr(i, 5)); }
+    const auto terminal = decoder.finish();
+    failures += check(terminal.tool_calls.size() == 1, "decoder did not keep the call");
+    failures += check(visible + terminal.content == "Running the tests.\nDone, waiting for output.",
+                      "trailing prose lost its separator: " + visible + "|" + terminal.content);
+    return failures;
+}
+
 int main() {
     int failures = 0;
     failures += test_free_tool_continuation();
@@ -774,6 +1050,15 @@ int main() {
     failures += test_incremental_valid_and_boolean();
     failures += test_incremental_fallback_preserves_bytes();
     failures += test_incremental_embedded_parameter_markup();
+    failures += test_tolerant_recovers_unrepresentable_delimiters();
+    failures += test_tolerant_multi_parameter_value_quoting_close();
+    failures += test_tolerant_prose_around_calls();
+    failures += test_tolerant_keeps_unrecoverable_fallback();
+    failures += test_tolerant_incremental_decoder();
+    failures += test_tolerant_never_runs_a_quoted_call();
+    failures += test_tolerant_trailing_details();
+    failures += test_tolerant_second_review();
+    failures += test_tolerant_quoted_call_end();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

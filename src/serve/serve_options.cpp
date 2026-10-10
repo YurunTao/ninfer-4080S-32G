@@ -1,6 +1,8 @@
 #include "serve/serve_options.h"
 #include "product/speculative_options.h"
 
+#include <algorithm>
+
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -45,59 +47,15 @@ std::uint64_t parse_u64(const char* text, const char* label) {
     return static_cast<std::uint64_t>(value);
 }
 
-std::size_t parse_host_context_mib(const char* text) {
-    constexpr std::size_t bytes_per_mib = 1ULL << 20;
-    constexpr std::size_t maximum       = std::numeric_limits<std::size_t>::max();
-    const std::string_view value(text);
-    const std::size_t point      = value.find('.');
-    const std::string_view whole = value.substr(0, point);
-    std::string_view fraction =
-        point == std::string_view::npos ? std::string_view{} : value.substr(point + 1);
-    if (whole.empty() || whole.find_first_not_of("0123456789") != std::string_view::npos ||
-        (point != std::string_view::npos &&
-         (fraction.empty() ||
-          fraction.find_first_not_of("0123456789") != std::string_view::npos))) {
-        throw std::invalid_argument("--host-context-mib requires a nonnegative decimal MiB value");
-    }
-
-    std::size_t whole_mib = 0;
-    for (const char character : whole) {
-        const std::size_t digit = static_cast<std::size_t>(character - '0');
-        if (whole_mib > (maximum / bytes_per_mib - digit) / 10) {
-            throw std::invalid_argument("--host-context-mib is out of range");
-        }
-        whole_mib = whole_mib * 10 + digit;
-    }
-
-    // A whole-byte MiB value has at most 20 fractional decimal digits (1 MiB = 2^20 bytes).
-    // Use exact integer arithmetic so decimal parsing cannot round the requested budget upward.
-    while (!fraction.empty() && fraction.back() == '0') { fraction.remove_suffix(1); }
-    if (fraction.size() > 20) {
-        throw std::invalid_argument("--host-context-mib must resolve to a whole number of bytes");
-    }
-    unsigned __int128 numerator = 0;
-    unsigned __int128 divisor   = 1;
-    for (const char character : fraction) {
-        numerator = numerator * 10 + static_cast<unsigned int>(character - '0');
-        divisor *= 10;
-    }
-    numerator *= bytes_per_mib;
-    if (numerator % divisor != 0) {
-        throw std::invalid_argument("--host-context-mib must resolve to a whole number of bytes");
-    }
-    const std::size_t fractional_bytes = static_cast<std::size_t>(numerator / divisor);
-    const std::size_t whole_bytes      = whole_mib * bytes_per_mib;
-    if (fractional_bytes > maximum - whole_bytes) {
-        throw std::invalid_argument("--host-context-mib is out of range");
-    }
-    return whole_bytes + fractional_bytes;
-}
-
 KvCacheStorage parse_kv_dtype(const char* text) {
     const std::string value(text);
     if (value == "bf16") { return KvCacheStorage::BFloat16; }
     if (value == "int8") { return KvCacheStorage::Int8Group64; }
     if (value == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
+    if (value == "rk8v4") { return KvCacheStorage::RotatedInt8KeyInt4ValueGroup64; }
+    if (value == "rk4v4") { return KvCacheStorage::RotatedInt4KeyInt4ValueGroup64; }
+    if (value == "rk4v4-e8") { return KvCacheStorage::RK4V4E8; }
+    if (value == "rk2v4-e8") { return KvCacheStorage::RK2V4E8; }
     if (value == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
     if (value == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
     throw std::invalid_argument("invalid kv-dtype: " + value);
@@ -117,17 +75,22 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--prefill-chunk N] [--turn-checkpoints N (retired)] [--log-stats-interval-ms N] "
+           "[--device N] "
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
-           "[--device-state-slots N] [--host-context-mib N] "
-           "[--request-log-jsonl FILE] "
+           "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
+           "[--max-private-continuations N] [--max-shared-prefixes N] "
+           "[--max-long-anchors-per-continuation N] [--auto-long-anchors N] "
+           "[--request-log-jsonl FILE] [--slot-save-path DIR] [--auto-save-evicted] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
+           "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] "
+           "[--prefill-activations a16|int8] "
+           "[--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
-           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
-           "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
+           "[--vision] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--tolerant-tool-calls] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -141,24 +104,44 @@ std::string serve_usage_text(const char* argv0) {
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
-           "       --model-id overrides the artifact metadata.name reported by the server\n"
+           "       --slot-save-path enables llama.cpp-style session persistence: POST "
+           "/slots/{id}?action=save|restore|erase with {\"filename\": NAME} moves one idle "
+           "slot's resident session to or from DIR (disabled when omitted)\n"
+           "       --turn-checkpoints is RETIRED and has no effect. Per-sequence rewrite "
+           "checkpoints and long anchors serve the same mid-history divergence, sized by "
+           "--max-long-anchors-per-continuation and placed by --auto-long-anchors; the value is "
+           "accepted and ignored so existing command lines keep starting, and the flag goes "
+           "away in a later release\n"
+           "       --auto-long-anchors N proposes a private long anchor at each of the last N "
+           "message boundaries of every prompt, so a client that rewrites recent history "
+           "restores at the anchor below the edit instead of re-prefilling from zero; coverage "
+           "reaches back only as far as the retained cap (the shallowest anchor is evicted when "
+           "the set is full), so raise it with --max-long-anchors-per-continuation and "
+           "--host-state-slots for deeper edits; defaults to the cap and is clamped to it; "
+           "0 disables (anchors then need explicit markers, which no HTTP protocol can place)\n"
+           "       --auto-save-evicted spills an involuntarily evicted session back to the "
+           "slot file it was last saved to or restored from, before the eviction destroys it "
+           "(requires --slot-save-path; explicit erase never auto-saves)\n"
+           "       --model-id overrides the artifact identity.model_id reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
+           "       --vision-max-tokens sets the Vision scratchpad token capacity (default 8192)\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
-           "       --no-prefix-reuse disables cross-request history; request pause/replay "
-           "resources remain available\n"
-           "       context defaults: device-state=max-concurrency; Host budget is resolved from "
-           "8192 MiB plus eight native StateImages\n"
-           "       --device-state-slots is extra capacity beyond active lanes; "
-           "--host-context-mib bounds shared Host State/KV and in-flight storage in MiB\n"
-           "       --host-context-mib accepts decimal MiB values that resolve to whole bytes\n"
+           "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
+           "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
+           "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
+           "--host-kv-mib uses MiB\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
+           "       --tolerant-tool-calls recovers complete Qwen tool calls that the strict parser "
+           "would return\n"
+           "       as text: parameter values quoting tool markup, prose before or after the calls\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
            "       --greedy forces temperature 0 (exact argmax).\n";
@@ -179,6 +162,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
+    bool context_capacity_explicit   = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -220,6 +204,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+        } else if (arg == "--turn-checkpoints") {
+            // Retired, but still accepted: the deployed container line passes it, and an
+            // unknown argument is fatal below. The value is validated and dropped; main()
+            // warns once. Remove the flag, this branch and the dead field together, one
+            // release after the warning ships.
+            (void)parse_nonnegative_int(require_value("--turn-checkpoints"), "turn-checkpoints");
+            options.deprecated_turn_checkpoints_given = true;
+        } else if (arg == "--auto-save-evicted") {
+            options.auto_save_evicted = true;
         } else if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {
@@ -259,13 +252,45 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--device-state-slots") {
             options.context_cache.device_state_slots = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--device-state-slots"), "device-state-slots"));
-        } else if (arg == "--host-context-mib") {
-            options.context_cache.host_capacity_bytes =
-                parse_host_context_mib(require_value("--host-context-mib"));
+            context_capacity_explicit = true;
+        } else if (arg == "--host-state-slots") {
+            options.context_cache.host_state_slots = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--host-state-slots"), "host-state-slots"));
+            context_capacity_explicit = true;
+        } else if (arg == "--host-kv-mib") {
+            const std::uint64_t mib = parse_u64(require_value("--host-kv-mib"), "host-kv-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--host-kv-mib is out of range");
+            }
+            options.context_cache.host_kv_capacity_bytes = static_cast<std::size_t>(mib << 20);
+            context_capacity_explicit                    = true;
+        } else if (arg == "--max-private-continuations") {
+            options.context_cache.max_private_continuations =
+                static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--max-private-continuations"), "max-private-continuations"));
+            context_capacity_explicit = true;
+        } else if (arg == "--max-shared-prefixes") {
+            options.context_cache.max_shared_prefixes =
+                static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--max-shared-prefixes"), "max-shared-prefixes"));
+            context_capacity_explicit = true;
+        } else if (arg == "--max-long-anchors-per-continuation") {
+            options.context_cache.max_long_anchors_per_continuation = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--max-long-anchors-per-continuation"),
+                                      "max-long-anchors-per-continuation"));
+            context_capacity_explicit = true;
+        } else if (arg == "--auto-long-anchors") {
+            options.auto_long_anchors = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--auto-long-anchors"), "auto-long-anchors"));
         } else if (arg == "--request-log-jsonl") {
             options.request_log_jsonl = require_value("--request-log-jsonl");
             if (options.request_log_jsonl.empty()) {
                 throw std::invalid_argument("--request-log-jsonl must not be empty");
+            }
+        } else if (arg == "--slot-save-path") {
+            options.slot_save_path = require_value("--slot-save-path");
+            if (options.slot_save_path.empty()) {
+                throw std::invalid_argument("--slot-save-path must not be empty");
             }
         } else if (arg == "--response-store-max-records") {
             const int records = parse_nonnegative_int(require_value("--response-store-max-records"),
@@ -285,6 +310,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+        } else if (arg == "--prefill-activations") {
+            const std::string value = require_value("--prefill-activations");
+            if (value == "a16") {
+                options.prefill_activations = PrefillActivations::A16;
+            } else if (value == "int8") {
+                options.prefill_activations = PrefillActivations::Int8;
+            } else {
+                throw std::invalid_argument("invalid prefill-activations: " + value);
+            }
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
@@ -304,18 +338,25 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.default_thinking_budget = static_cast<std::uint32_t>(budget);
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--vision-max-tokens" || arg == "--vision-limit") {
+            const int val = parse_nonnegative_int(require_value(arg.c_str()), "vision-max-tokens");
+            if (val <= 0) {
+                throw std::invalid_argument(std::string(arg) + " must be positive");
+            }
+            options.vision_max_tokens = static_cast<std::uint32_t>(val);
+            options.enable_vision     = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
-        } else if (arg == "--chat-template") {
-            options.chat_template_path = require_value("--chat-template");
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
         } else if (arg == "--preserve-thinking") {
             options.preserve_thinking = true;
+        } else if (arg == "--tolerant-tool-calls") {
+            options.tolerant_tool_calls = true;
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--temperature") {
@@ -350,7 +391,19 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
     }
-    options.context_cache.enabled = options.allow_prefix_reuse;
+    if (options.auto_save_evicted && options.slot_save_path.empty()) {
+        throw std::invalid_argument("--auto-save-evicted requires --slot-save-path");
+    }
+    if (!options.allow_prefix_reuse) {
+        if (context_capacity_explicit) {
+            throw std::invalid_argument(
+                "--no-prefix-reuse cannot be combined with context-cache capacity options");
+        }
+        options.context_cache.enabled                = false;
+        options.context_cache.host_state_slots       = 0;
+        options.context_cache.host_kv_capacity_bytes = 0;
+        options.auto_long_anchors                    = 0;
+    }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
@@ -384,12 +437,19 @@ ServeOptions parse_serve_options(int argc, char** argv) {
 }
 
 std::string resolve_public_model_id(const ServeOptions& options,
-                                    std::string_view artifact_model_name) {
+                                    std::string_view artifact_model_id) {
     if (options.model_id_override.has_value()) { return *options.model_id_override; }
-    if (artifact_model_name.empty()) {
-        throw std::logic_error("loaded artifact model name must not be empty");
+    if (artifact_model_id.empty()) {
+        throw std::logic_error("loaded artifact model_id must not be empty");
     }
-    return std::string(artifact_model_name);
+    return std::string(artifact_model_id);
+}
+
+std::uint32_t resolve_automatic_private_anchors(const ServeOptions& options,
+                                                const ContextCacheOptions& resolved) {
+    if (!resolved.enabled || !options.allow_prefix_reuse) { return 0; }
+    const std::uint32_t cap = resolved.max_long_anchors_per_continuation.value_or(0U);
+    return std::min(options.auto_long_anchors.value_or(cap), cap);
 }
 
 } // namespace ninfer::serve

@@ -3,6 +3,10 @@
 // Product-side adapter from one protocol-neutral generation request to the public Engine. Wire
 // adapters normalize before this layer and render IDs, usage, and response events after it.
 
+namespace spdlog {
+class logger;
+}
+
 #include "ninfer/engine.h"
 #include "serve/request.h"
 #include "serve/serve_options.h"
@@ -10,7 +14,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <exception>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -23,20 +26,15 @@ struct RequestLifetime;
 struct RequestCapacity;
 
 struct GenerationMetrics {
-    std::uint64_t engine_request_id       = 0;
-    std::uint32_t computed_prefill_tokens = 0;
-    double prepare_seconds                = 0.0;
-    double ttft_seconds                   = 0.0;
-    double vision_seconds                 = 0.0;
-    double prefill_seconds                = 0.0;
-    double decode_seconds                 = 0.0;
-    double prompt_wall_seconds            = 0.0;
-    double generation_wall_seconds        = 0.0;
-    double total_seconds                  = 0.0;
+    double prepare_seconds         = 0.0;
+    double ttft_seconds            = 0.0;
+    double vision_seconds          = 0.0;
+    double prefill_seconds         = 0.0;
+    double decode_seconds          = 0.0;
+    double prompt_wall_seconds     = 0.0;
+    double generation_wall_seconds = 0.0;
+    double total_seconds           = 0.0;
     ninfer::GenerationEngineTiming engine_timing;
-    std::optional<ninfer::GenerationFirstOutputTiming> first_output_timing;
-    ninfer::GenerationSchedulingStats scheduling;
-    ninfer::GenerationAdmissionStats admission;
 
     SpeculativeBackend speculative_backend    = SpeculativeBackend::None;
     std::uint32_t speculative_draft_window    = 0;
@@ -47,19 +45,18 @@ struct GenerationMetrics {
     std::vector<std::uint64_t> speculative_accepted_per_position;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::Root;
+    ninfer::MaterializationDiagnostics materialization;
 };
 
 struct GenerationOutcome {
     std::string text;
     std::string reasoning;
-    std::vector<ninfer::TokenId> generated_token_ids;
     std::vector<ninfer::GeneratedToolCall> tool_calls;
     ninfer::ToolCallParseDiagnostics tool_call_parse;
     int prompt_tokens     = 0;
     int completion_tokens = 0;
     int reasoning_tokens  = 0;
     ninfer::ThinkingBudgetStats thinking;
-    std::optional<ninfer::ConstraintObservation> constraint;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     std::optional<std::string> matched_stop_string;
     GenerationMetrics metrics;
@@ -67,13 +64,6 @@ struct GenerationOutcome {
     // not retain it) - the handle a client needs for /slots save operations.
     int id_slot = -1;
     std::string session_digest;
-};
-
-// A transport may report an interrupted stream through a callback or is_cancelled().
-// Generation still settles through Engine cancellation and returns its actual work statistics.
-class ClientDisconnected final : public std::exception {
-public:
-    [[nodiscard]] const char* what() const noexcept override { return "client disconnected"; }
 };
 
 struct StreamSink {
@@ -91,40 +81,43 @@ enum class GenerationConsumerMode : std::uint8_t {
 };
 
 // Translate Engine request failures into the shared protocol-neutral HTTP error contract.
-ApiError
-request_error_to_api_error(const ninfer::RequestError& exception,
-                           std::string_view constraint_param = "structured_outputs.grammar",
-                           std::span<const std::string> tool_schema_params = {});
+ApiError request_error_to_api_error(const ninfer::RequestError& exception);
 
 // Preparation ends by synchronously submitting the owning prompt to the Engine FIFO. The returned
 // request keeps its ingress/response lifetime reservation until the HTTP response is released and
 // is consumed exactly once by run().
 struct PreparedRequest {
-    std::string constraint_param;
-    std::vector<std::string> tool_schema_params;
     ninfer::GenerationHandle generation;
     ninfer::ResolvedSamplingParameters sampling;
-    // Service input acquisition/bookkeeping; Engine timings own prompt and constraint preparation.
-    double service_prepare_seconds = 0.0;
+    double prepare_seconds     = 0.0;
     double acquisition_seconds = 0.0;
     PromptPreparationStats preparation;
     int prompt_tokens    = 0;
     bool enable_thinking = true;
     std::optional<std::uint32_t> thinking_budget;
-    std::optional<ninfer::ReasoningEffort> reasoning_effort;
-    std::optional<bool> preserve_thinking;
+    std::optional<ninfer::ReasoningEffort> effective_reasoning_effort;
+    bool preserve_thinking = false;
     std::shared_ptr<RequestLifetime> lifetime;
 };
 
 class GenerationService {
 public:
-    explicit GenerationService(ServeOptions options, StartupObserver startup_observer = {});
+    // The logger is fork-local: the auto-save-on-eviction listener reports through it, and
+    // that line is the only production evidence that eviction spills actually happen.
+    explicit GenerationService(ServeOptions options, StartupObserver startup_observer = {},
+                               std::shared_ptr<spdlog::logger> logger = {});
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
 
     // Engine owns the once-normalized startup configuration. Serving diagnostics must use this
     // value instead of reinterpreting optional defaults from ServeOptions.
     [[nodiscard]] const ninfer::EngineOptions& engine_options() const { return engine_->options(); }
+
+    // Engine-automatic private long anchors stamped on every prepared prompt; see
+    // resolve_automatic_private_anchors. Reported on the boot line and the server_start record.
+    [[nodiscard]] std::uint32_t automatic_private_anchors() const noexcept {
+        return automatic_private_anchors_;
+    }
 
     [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine_->load_summary(); }
 
@@ -135,6 +128,8 @@ public:
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }
+
+    [[nodiscard]] std::size_t active_request_count() const;
 
     [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {
         return engine_->media_cache_summary();
@@ -161,10 +156,6 @@ public:
     [[nodiscard]] std::vector<ninfer::SlotState> slot_states() const {
         return engine_->slot_states();
     }
-
-    // Shutdown flush: snapshot every retained session into the on-disk store and wait for the
-    // files to land. Returns the number of sessions written (0 without a store).
-    std::size_t flush_sessions();
 
     // The slot id space of /slots operations: one slot per private continuation-catalog cell
     // (resolved at Engine construction; at least max_concurrency).
@@ -207,7 +198,10 @@ private:
     acquire_request_lifetime(DeadlinePolicy deadline_policy) const;
 
     ServeOptions options_;
+    std::shared_ptr<spdlog::logger> logger_;
     std::unique_ptr<ninfer::Engine> engine_;
+    std::uint32_t automatic_private_anchors_ = 0;
+    ninfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;
 };
 

@@ -10,6 +10,7 @@
 #include <spdlog/logger.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <charconv>
 #include <chrono>
 #include <cctype>
@@ -48,15 +49,24 @@ struct Options {
     std::uint32_t stride                = 2048;
     int device                          = 0;
     ninfer::KvCacheStorage kv           = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    ninfer::PrefillActivations prefill_activations = ninfer::PrefillActivations::A16;
     bool quick                          = false;
     ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
 };
+
+// NINFER_A16_PREFILL=1 forces A16 over the option, as in the engine (variant.cpp).
+const char* prefill_activations_in_effect(const Options& options) {
+    const char* forced = std::getenv("NINFER_A16_PREFILL");
+    if (forced != nullptr && forced[0] == '1') { return "a16"; }
+    return ninfer::prefill_activations_name(options.prefill_activations);
+}
 
 std::string usage_text() {
     return "usage: ninfer-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--device N]\n"
-           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--output <directory>]\n"
+           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--prefill-activations a16|int8]\n"
+           "       [--output <directory>]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
 
@@ -116,6 +126,15 @@ Options parse_options(int argc, char** argv) {
             } else {
                 usage_error("--kv-dtype must be bf16, int8, fp8, nvfp4, or k8v4");
             }
+        } else if (option == "--prefill-activations") {
+            const std::string_view activations = value("--prefill-activations");
+            if (activations == "a16") {
+                out.prefill_activations = ninfer::PrefillActivations::A16;
+            } else if (activations == "int8") {
+                out.prefill_activations = ninfer::PrefillActivations::Int8;
+            } else {
+                usage_error("--prefill-activations must be a16 or int8");
+            }
         } else if (option == "--output") {
             out.output = std::filesystem::path(value("--output"));
         } else if (option == "--log-level") {
@@ -163,7 +182,11 @@ std::string safe_component(std::string_view value) {
 std::string timestamp() {
     const std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     std::tm utc{};
+#ifdef _WIN32
+    (void)::gmtime_s(&utc, &now);
+#else
     gmtime_r(&now, &utc);
+#endif
     std::ostringstream out;
     out << std::put_time(&utc, "%Y%m%d-%H%M%S");
     return out.str();
@@ -173,9 +196,9 @@ std::filesystem::path prepare_output_directory(const Options& options,
                                                const ninfer::LoadSummary& load,
                                                const CorpusSelection& corpus) {
     std::filesystem::path output = options.output.value_or(
-        std::filesystem::path("profiles/perplexity") / safe_component(load.model_name) /
-        safe_component(load.prefill_signature) / kv_name(options.kv) /
-        safe_component(corpus.corpus_id) / safe_component(corpus.mode) / timestamp());
+        std::filesystem::path("profiles/perplexity") / safe_component(load.model_id) /
+        safe_component(load.weights_id) / kv_name(options.kv) / safe_component(corpus.corpus_id) /
+        safe_component(corpus.mode) / timestamp());
     if (std::filesystem::exists(output)) {
         if (!std::filesystem::is_directory(output) ||
             std::filesystem::directory_iterator(output) != std::filesystem::directory_iterator()) {
@@ -215,6 +238,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.device           = options.device;
     engine_options.max_context      = options.context;
     engine_options.kv_cache         = options.kv;
+    engine_options.prefill_activations = options.prefill_activations;
     engine_options.startup_observer = startup_log.observer();
     ninfer::Engine engine(std::move(engine_options));
     const ninfer::LoadSummary load = engine.load_summary();
@@ -366,15 +390,14 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     }
 
     json report{
-        {"schema_version", 2},
+        {"schema_version", 1},
         {"metric",
          {{"name", "fixed-window truncated-context causal perplexity"}, {"log_base", "natural"}}},
         {"artifact",
          {{"path", std::filesystem::absolute(options.artifact).lexically_normal().string()},
-          {"architecture", load.architecture},
-          {"name", load.model_name},
-          {"prefill_signature", load.prefill_signature},
-          {"formats", load.weight_formats}}},
+          {"target", load.target},
+          {"model_id", load.model_id},
+          {"weights_id", load.weights_id}}},
         {"corpus",
          {{"id", corpus.corpus_id},
           {"mode", corpus.mode},
@@ -387,7 +410,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"stride_tokens", options.stride},
           {"prefill_chunk_tokens", 1024},
           {"score_tile_tokens", 1024},
-          {"kv_dtype", kv_name(options.kv)}}},
+          {"kv_dtype", kv_name(options.kv)},
+          {"prefill_activations", prefill_activations_in_effect(options)}}},
         {"timing",
          {{"load_seconds", load.load_seconds},
           {"read_and_tokenize_seconds", preflight_seconds},
@@ -412,8 +436,9 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     std::filesystem::rename(temporary, final);
 
     std::cout << "Perplexity result\n"
-              << "artifact: " << load.model_name << '\n'
-              << "kv: " << kv_name(options.kv) << ", corpus: " << corpus.corpus_id << " / "
+              << "artifact: " << load.model_id << " / " << load.weights_id << '\n'
+              << "kv: " << kv_name(options.kv)
+              << ", prefill activations: " << prefill_activations_in_effect(options) << ", corpus: " << corpus.corpus_id << " / "
               << corpus.mode << ", context/stride: " << options.context << '/' << options.stride
               << "\n\n";
     std::cout << std::left << std::setw(24) << "domain" << std::right << std::setw(16) << "tokens"

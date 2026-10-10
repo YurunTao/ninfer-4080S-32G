@@ -387,6 +387,9 @@ int run_nvfp4() {
             seed);
     };
     for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4}) {
+#ifdef NINFER_SM86
+        if (policy == ops::LinearPolicy::AllowA4) continue; // no A4 tensor cores on sm_86/sm_89
+#endif
         for (int width = 2; width <= 16; ++width) {
             failures += run(width, 1, {}, policy, 1600U + width);
             failures += run(width, 8, ragged(width, 8), policy, 1650U + width);

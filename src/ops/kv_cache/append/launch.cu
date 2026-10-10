@@ -51,7 +51,8 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    if (cache.storage == KvCacheStorage::Int8Group64) {
+    if (kv_storage_is_int8_family(cache.storage)) {
+        const KvForkModeFlags mode = kv_fork_mode_flags(cache.storage);
         Tensor& cache_k_scale = cache.k_scale_pages;
         Tensor& cache_v_scale = cache.v_scale_pages;
         const auto launch_fill = [&]<bool PackedV, bool RotateK, bool RotateV, bool PackedK,
@@ -90,13 +91,13 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
                         static_cast<__half*>(cache_v_scale.data), tokens);
             }
         };
-        if (cache.e8_root) {
+        if (mode.e8_root) {
             launch_fill.template operator()<true, true, true, false, false, true>();
-        } else if (cache.e8_lattice) {
+        } else if (mode.e8_lattice) {
             launch_fill.template operator()<true, true, true, true, true, false>();
-        } else if (cache.packed_k) {
+        } else if (mode.packed_k) {
             launch_fill.template operator()<true, true, true, true, false, false>();
-        } else if (cache.packed_v) {
+        } else if (mode.packed_v) {
             launch_fill.template operator()<true, true, true, false, false, false>();
         } else {
             launch_fill.template operator()<false, false, false, false, false, false>();

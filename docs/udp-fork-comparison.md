@@ -129,7 +129,11 @@ green 84/84 suite on their side. Disposition per group:
   media instead of failing whenever the newest item alone fits the limit.) With the port,
   `rk4v4-e8` serves the full native
   262,144 context with `--vision` at 780 MiB slack - the 208K practical line and
-  the vision-against-context tradeoff are gone.
+  the vision-against-context tradeoff are gone. Correction (2026-09-23): upstream
+  `fc5c4834` (2026-08-24) later made the tower encode one item at a time, so the
+  limit now applies to each item and the aggregate budget is back at upstream's
+  32768. The aggregate wiring had rejected agent conversations after about ten
+  screenshots, because clients send every earlier image again with each turn.
 - **CUDA-graph allowance tightening (c85db47a): skipped.** They replace their old
   1 GiB SM86/SM89 per-lane padding with flat 64 MiB (ordinary) / 256-320 MiB (MTP)
   allowances. This branch already carries the per-topology-class accounting, which

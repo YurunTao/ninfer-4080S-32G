@@ -9,8 +9,6 @@
 
 #include <cstdint>
 #include <exception>
-#include <fstream>
-#include <iterator>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -84,6 +82,14 @@ std::string format_kv_cache(ninfer::KvCacheStorage storage) {
         return "int8-group64";
     case ninfer::KvCacheStorage::Fp8E4M3Row256:
         return "fp8-e4m3-row256";
+    case ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+        return "rk8v4";
+    case ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+        return "rk4v4";
+    case ninfer::KvCacheStorage::RK4V4E8:
+        return "rk4v4-e8";
+    case ninfer::KvCacheStorage::RK2V4E8:
+        return "rk2v4-e8";
     case ninfer::KvCacheStorage::Nvfp4Group16:
         return "nvfp4";
     case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
@@ -148,7 +154,7 @@ private:
 void print_generation_summary(const ninfer::GenerationResult& result,
                               const ninfer::ResolvedSamplingParameters& sampling,
                               const ninfer::MemorySummary& memory) {
-    print_stage("prepare", "request preparation", result.timings.prepare_seconds);
+    print_stage("prepare", "render/preprocess", result.timings.prepare_seconds);
     print_stage("generate", "vision", result.timings.vision_seconds);
     print_stage("generate", "text prefill", result.timings.prefill_seconds);
     print_stage("generate", "decode", result.timings.decode_seconds);
@@ -189,7 +195,20 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("gpu weights used", format_arena_used(memory.weights));
     print_metric("gpu sequence used", format_arena_used(memory.sequence));
     print_metric("kv cache dtype", format_kv_cache(memory.kv_cache));
-    print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));
+    print_metric("kv cache payload (total)", format_bytes(memory.kv_payload_bytes));
+    print_metric("  text kv payload", format_bytes(memory.text_kv_bytes));
+    if (memory.mtp_kv_bytes > 0) {
+        print_metric("  mtp kv payload", format_bytes(memory.mtp_kv_bytes));
+    }
+    if (memory.dflash_kv_bytes > 0) {
+        print_metric("  dflash kv payload", format_bytes(memory.dflash_kv_bytes));
+    }
+    if (memory.gdn_state_bytes > 0) {
+        print_metric("  gdn state payload", format_bytes(memory.gdn_state_bytes));
+    }
+    if (memory.replay_records_bytes > 0) {
+        print_metric("  replay records payload", format_bytes(memory.replay_records_bytes));
+    }
     print_metric("gpu workspace peak", format_arena_peak(memory.workspace));
     print_metric("runtime reservation", format_bytes(memory.runtime_reservation_bytes));
     print_metric("free after weights", format_bytes(memory.available_after_weights_bytes));
@@ -261,22 +280,6 @@ int main(int argc, char** argv) {
         input.options.reasoning_effort = cli.reasoning_effort;
 
         ninfer::RequestOptions request;
-        if (cli.json_object)
-            request.constraint = ninfer::OutputConstraint::json_object();
-        else if (cli.regex)
-            request.constraint = ninfer::OutputConstraint::regex(*cli.regex);
-        else if (!cli.choices.empty())
-            request.constraint = ninfer::OutputConstraint::choice(cli.choices);
-        else if (!cli.grammar_path.empty() || !cli.json_schema_path.empty()) {
-            const auto& path = cli.grammar_path.empty() ? cli.json_schema_path : cli.grammar_path;
-            std::ifstream file(path, std::ios::binary);
-            if (!file) throw std::invalid_argument("cannot open constraint file: " + path.string());
-            std::string source(std::istreambuf_iterator<char>(file), {});
-            if (file.bad()) throw std::runtime_error("failed to read constraint file");
-            request.constraint = cli.grammar_path.empty()
-                                     ? ninfer::OutputConstraint::json_schema(std::move(source))
-                                     : ninfer::OutputConstraint::grammar(std::move(source));
-        }
         request.execution.sampling                = cli.sampling;
         request.execution.requested_output_tokens = cli.max_new;
         request.execution.thinking.budget         = cli.thinking_budget;
@@ -285,22 +288,22 @@ int main(int argc, char** argv) {
         request.output.raw                        = cli.raw_output;
 
         ninfer::EngineOptions engine_options;
-        engine_options.artifact_path      = cli.artifact_path;
-        engine_options.chat_template_path = cli.chat_template_path;
-        engine_options.device             = cli.device;
-        engine_options.max_context        = cli.max_context;
-        engine_options.kv_capacity        = cli.kv_capacity;
-        engine_options.prefill_chunk      = cli.prefill_chunk;
-        engine_options.kv_cache           = cli.kv_cache;
-        engine_options.speculative        = cli.speculative;
-        engine_options.enable_vision      = cli.enable_vision;
-        engine_options.use_cuda_graph     = cli.use_cuda_graph;
-        // One CLI invocation owns exactly one request and needs neither history nor pause
-        // storage, so select those resource capacities explicitly.
-        engine_options.context_cache.enabled             = false;
-        engine_options.context_cache.device_state_slots  = 0;
-        engine_options.context_cache.host_capacity_bytes = 0;
-        engine_options.startup_observer                  = startup_log.observer();
+        engine_options.artifact_path  = cli.artifact_path;
+        engine_options.device         = cli.device;
+        engine_options.max_context    = cli.max_context;
+        engine_options.kv_capacity    = cli.kv_capacity;
+        engine_options.prefill_chunk  = cli.prefill_chunk;
+        engine_options.kv_cache       = cli.kv_cache;
+        engine_options.speculative    = cli.speculative;
+        engine_options.enable_vision     = cli.enable_vision;
+        engine_options.vision_max_tokens = cli.vision_max_tokens;
+        engine_options.use_cuda_graph    = cli.use_cuda_graph;
+        // One CLI invocation owns exactly one request, so retained cross-request context has no
+        // consumer and must not reserve an extra Device StateImage or run terminal capture.
+        engine_options.context_cache.enabled                = false;
+        engine_options.context_cache.host_state_slots       = 0;
+        engine_options.context_cache.host_kv_capacity_bytes = 0;
+        engine_options.startup_observer                     = startup_log.observer();
 
         ninfer::Engine engine(std::move(engine_options));
         startup_log.engine_ready(engine.load_summary());

@@ -1,6 +1,7 @@
 #pragma once
 
-#include "core/weight.h"
+#include "ninfer/ops/linear.h"
+
 #include "core/arena.h"
 
 #include <cuda_runtime.h>
@@ -11,19 +12,14 @@
 namespace ninfer::ops::detail {
 
 enum class Q5LinearAddScheduleId {
+    GemvResidual,
     Split2ExactResidual,
-    SlicedR16T8W4S2,
-    SlicedR16T16W4S2,
-    SlicedR16T24W4S2,
-    SlicedR32T32W4S2,
-    SlicedR32T24W4S2Pairwise,
-    SlicedR32T32W4S1,
-    SlicedR32T32W2S2,
-    SlicedR32T64W2S1,
-    MmaResidualR32T32K128,
-    MmaResidualR32T128,
-    MmaResidualR64T128,
-    MmaResidualR64T128Tail,
+    MmaResidualR64C16,
+    MmaResidualR64C24,
+    MmaResidualR64C32S3,
+    MmaResidualR64C32S4,
+    MmaResidualR64C128,
+    Int8ResidualR64C128,
 };
 
 struct Q5LinearAddProblem {
@@ -41,15 +37,16 @@ struct Q5LinearAddPlan {
 const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept;
 
 bool q5_linear_add_admits(const Q5LinearAddProblem& problem) noexcept;
-Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem);
+Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem, LinearPolicy policy);
 
 std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32_t k,
                                                    std::int32_t padded_k, std::int32_t min_cols,
-                                                   std::int32_t max_cols);
+                                                   std::int32_t max_cols, LinearPolicy policy);
 
 void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, const Weight& w,
-                                Tensor& residual_out, WorkspaceArena& ws, cudaStream_t stream);
+                                Tensor& residual_out, WorkspaceArena& ws, LinearPolicy policy,
+                                cudaStream_t stream);
 void q5_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                            WorkspaceArena& ws, cudaStream_t stream);
+                            WorkspaceArena& ws, LinearPolicy policy, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

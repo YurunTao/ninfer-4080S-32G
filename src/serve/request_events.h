@@ -10,6 +10,15 @@
 
 namespace ninfer::serve {
 
+// Fork-local: the host-exposed total this deployment reports on the request line. Shared
+// between the operational renderer and the JSONL record so the two cannot drift.
+[[nodiscard]] inline double
+request_host_exposed_seconds(const ninfer::GenerationEngineTiming& timing) noexcept {
+    return timing.engine_boundary_exposed_seconds + timing.program_submit_exposed_seconds +
+           timing.program_post_exposed_seconds + timing.engine_commit_output_exposed_seconds +
+           timing.engine_maintenance_exposed_seconds;
+}
+
 struct RequestLogContext {
     std::uint64_t id = 0;
     std::string http_request_id;

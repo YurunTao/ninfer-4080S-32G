@@ -1,10 +1,10 @@
 #pragma once
 
 #include "serve/generation_service.h"
-#include "serve/metrics.h"
 #include "serve/operational_log.h"
 #include "serve/openai_responses_store.h"
 #include "serve/request_log.h"
+#include "serve/serve_metrics.h"
 #include "serve/serve_options.h"
 
 #include <httplib.h>
@@ -88,11 +88,9 @@ private:
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
+    void handle_slot_action(const httplib::Request& req, httplib::Response& res);
 
     void record_request_start(const RequestLogContext& context);
-    [[nodiscard]] ninfer::GenerationSchedulingObserver
-    scheduling_observer(std::uint64_t request_id, std::string http_request_id);
-    [[nodiscard]] ninfer::GenerationFirstTokenObserver first_token_observer();
     void record_request_rejected(const RequestRejectionLogContext& context);
     void record_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void record_request_failure(const RequestLogContext& context, const RequestFailure& failure);
@@ -105,9 +103,13 @@ private:
     ServeOptions options_;
     std::string public_model_id_;
     OpenAIResponsesStore openai_responses_store_;
+    ServeMetrics metrics_;
+    // Fork-local: the slot routes are ours and have no OperationalLog equivalent, so they
+    // log through the raw logger. Declared before operational_log_ to keep the member
+    // initialisation order matching the declaration order.
+    std::shared_ptr<spdlog::logger> logger_;
     OperationalLog operational_log_;
     JsonlRequestLog request_jsonl_;
-    Metrics metrics_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};
     std::mutex stats_mutex_;

@@ -1,15 +1,14 @@
 #include "serve/request_log.h"
-#include "product/constraint_observation.h"
 #include "product/logging/pretty_format.h"
 #include "product/speculative_options.h"
 
+#include <cstdlib>
 #include <spdlog/logger.h>
 
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <filesystem>
 #include <iomanip>
@@ -19,10 +18,20 @@
 #include <system_error>
 #include <utility>
 
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace ninfer::serve {
 namespace {
+
+// Same rule as the engine's (variant.cpp) and the boot line's.
+bool a16_prefill_env() {
+    const char* value = std::getenv("NINFER_A16_PREFILL");
+    return value != nullptr && value[0] == '1';
+}
 
 using Json = nlohmann::json;
 
@@ -40,7 +49,12 @@ std::uint64_t unix_time_ms() {
 std::string new_server_instance_id() {
     const auto now    = std::chrono::system_clock::now().time_since_epoch();
     const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
-    return "serve-" + std::to_string(static_cast<long long>(::getpid())) + '-' +
+#ifdef _WIN32
+    const auto process_id = ::_getpid();
+#else
+    const auto process_id = ::getpid();
+#endif
+    return "serve-" + std::to_string(static_cast<long long>(process_id)) + '-' +
            std::to_string(micros);
 }
 
@@ -92,7 +106,9 @@ Json tool_call_parse_json(const ninfer::ToolCallParseDiagnostics& diagnostics) {
                 {"empty_arguments_omitted", diagnostics.empty_arguments_omitted},
                 {"schema_mismatch_arguments", diagnostics.schema_mismatch_arguments},
                 {"fallback_reason",
-                 ninfer::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)}};
+                 ninfer::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)},
+                {"recovered_from",
+                 ninfer::tool_call_parse_fallback_reason_name(diagnostics.recovered_from)}};
 }
 
 std::string tool_choice_name(const ToolChoice& choice) {
@@ -105,9 +121,27 @@ std::string tool_choice_name(const ToolChoice& choice) {
     return "unknown";
 }
 
+const char* reasoning_effort_name(ninfer::ReasoningEffort effort) {
+    switch (effort) {
+    case ninfer::ReasoningEffort::Low:
+        return "low";
+    case ninfer::ReasoningEffort::Medium:
+        return "medium";
+    case ninfer::ReasoningEffort::XHigh:
+        return "xhigh";
+    }
+    return "unknown";
+}
+
 Json requested_reasoning_effort_json(const std::optional<RequestedReasoningEffort>& requested) {
     return requested ? Json(std::string(requested_reasoning_effort_name(*requested)))
                      : Json(nullptr);
+}
+
+Json resolved_reasoning_effort_json(bool enable_thinking,
+                                    const std::optional<ninfer::ReasoningEffort>& resolved) {
+    if (!enable_thinking) { return "none"; }
+    return resolved ? Json(reasoning_effort_name(*resolved)) : Json(nullptr);
 }
 
 const char* kv_cache_name(ninfer::KvCacheStorage storage) {
@@ -118,6 +152,14 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) {
         return "int8-group64";
     case ninfer::KvCacheStorage::Fp8E4M3Row256:
         return "fp8-e4m3-row256";
+    case ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+        return "rk8v4";
+    case ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+        return "rk4v4";
+    case ninfer::KvCacheStorage::RK4V4E8:
+        return "rk4v4-e8";
+    case ninfer::KvCacheStorage::RK2V4E8:
+        return "rk2v4-e8";
     case ninfer::KvCacheStorage::Nvfp4Group16:
         return "nvfp4";
     case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
@@ -138,8 +180,16 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
     switch (path) {
     case ninfer::PrefixReusePath::Root:
         return "root";
-    case ninfer::PrefixReusePath::Checkpoint:
-        return "checkpoint";
+    case ninfer::PrefixReusePath::PrivateEndpoint:
+        return "private_endpoint";
+    case ninfer::PrefixReusePath::PrivateTurnClosure:
+        return "private_turn_closure";
+    case ninfer::PrefixReusePath::PrivateResponseReplay:
+        return "private_response_replay";
+    case ninfer::PrefixReusePath::PrivateLongAnchor:
+        return "private_long_anchor";
+    case ninfer::PrefixReusePath::SharedStablePrefix:
+        return "shared_stable_prefix";
     }
     return "unknown";
 }
@@ -150,41 +200,6 @@ Json event_base(const std::string& server_instance_id, std::uint64_t timestamp, 
                 {"event", event},
                 {"timestamp_unix_ms", timestamp},
                 {"server_instance_id", server_instance_id}};
-}
-
-const char* scheduling_transition_name(ninfer::GenerationSchedulingTransition transition) {
-    using Transition = ninfer::GenerationSchedulingTransition;
-    switch (transition) {
-    case Transition::PauseStarted:
-        return "pause_started";
-    case Transition::Paused:
-        return "paused";
-    case Transition::RestoreStarted:
-        return "restore_started";
-    case Transition::Restored:
-        return "restored";
-    case Transition::ReplayComplete:
-        return "replay_complete";
-    case Transition::RecoveryComplete:
-        return "recovery_complete";
-    case Transition::SnapshotRevoked:
-        return "snapshot_revoked";
-    case Transition::Terminal:
-        return "terminal";
-    }
-    throw std::logic_error("invalid scheduling transition");
-}
-
-Json recovery_route_json(ninfer::GenerationRecoveryRoute route) {
-    switch (route) {
-    case ninfer::GenerationRecoveryRoute::None:
-        return nullptr;
-    case ninfer::GenerationRecoveryRoute::Snapshot:
-        return "snapshot";
-    case ninfer::GenerationRecoveryRoute::Replay:
-        return "replay";
-    }
-    throw std::logic_error("invalid recovery route");
 }
 
 Json sampler_json(const ninfer::ResolvedSamplingParameters& sampling) {
@@ -228,8 +243,6 @@ Json request_json(const RequestLogContext& context) {
     Json thinking_budget = nullptr;
     if (context.thinking_budget) { thinking_budget = *context.thinking_budget; }
     return Json{{"request_id", context.id},
-                {"http_request_id", context.http_request_id},
-                {"response_id", context.response_id},
                 {"protocol", context.protocol},
                 {"model", context.model},
                 {"stream", context.stream},
@@ -245,8 +258,10 @@ Json request_json(const RequestLogContext& context) {
                 {"thinking_budget", std::move(thinking_budget)},
                 {"requested_reasoning_effort",
                  requested_reasoning_effort_json(context.requested_reasoning_effort)},
-                {"preserve_thinking",
-                 context.preserve_thinking ? Json(*context.preserve_thinking) : Json(nullptr)},
+                {"resolved_reasoning_effort",
+                 resolved_reasoning_effort_json(context.enable_thinking,
+                                                context.resolved_reasoning_effort)},
+                {"preserve_thinking", context.preserve_thinking},
                 {"preserve_thinking_semantic_change", context.preserve_thinking_semantic_change},
                 {"sampling", sampler_json(context.sampling)}};
 }
@@ -272,8 +287,6 @@ Json preparation_json(const RequestLogContext& context) {
 
 Json rejected_request_json(const RequestRejectionLogContext& context) {
     return Json{{"request_id", context.id},
-                {"http_request_id", context.http_request_id},
-                {"response_id", context.response_id},
                 {"protocol", context.protocol},
                 {"model", context.model},
                 {"stream", context.stream},
@@ -286,7 +299,8 @@ Json rejected_request_json(const RequestRejectionLogContext& context) {
                 {"tool_choice", tool_choice_name(context.tool_choice)},
                 {"has_tool_history", context.has_tool_history},
                 {"requested_reasoning_effort",
-                 requested_reasoning_effort_json(context.requested_reasoning_effort)}};
+                 requested_reasoning_effort_json(context.requested_reasoning_effort)},
+                {"resolved_reasoning_effort", nullptr}};
 }
 
 Json error_json(const ApiError& error) {
@@ -327,43 +341,34 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"accepted_per_position", metrics.speculative_accepted_per_position}};
 }
 
-Json scheduling_json(const ninfer::GenerationSchedulingStats& stats) {
-    return Json{{"preemptions", stats.preemptions},
-                {"snapshot_restores", stats.snapshot_restores},
-                {"replay_restores", stats.replay_restores},
-                {"replayed_tokens", stats.replayed_tokens},
-                {"paused_ns", stats.paused_ns},
-                {"device_to_host_bytes", stats.device_to_host_bytes},
-                {"host_to_device_bytes", stats.host_to_device_bytes}};
-}
-
-Json admission_json(const ninfer::GenerationAdmissionStats& stats) {
-    const char* reason = nullptr;
-    switch (stats.fallback_reason) {
-    case ninfer::AdmissionFallbackReason::None:
-        reason = "none";
-        break;
-    case ninfer::AdmissionFallbackReason::SourceInvalid:
-        reason = "source_invalid";
-        break;
-    case ninfer::AdmissionFallbackReason::SourceRevoked:
-        reason = "source_revoked";
-        break;
-    case ninfer::AdmissionFallbackReason::CostChanged:
-        reason = "cost_changed";
-        break;
-    case ninfer::AdmissionFallbackReason::CapacityLimit:
-        reason = "capacity_limit";
-        break;
-    case ninfer::AdmissionFallbackReason::IsolatedCapacity:
-        reason = "isolated_capacity";
-        break;
-    }
-    if (!reason) { throw std::logic_error("invalid admission fallback reason"); }
-    return Json{{"preferred_reused_tokens", stats.preferred_reused_tokens},
-                {"source_wait_seconds", stats.source_wait_seconds},
-                {"revoked_checkpoints", stats.revoked_checkpoints},
-                {"fallback_reason", reason}};
+Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics) {
+    return Json{
+        {"predicted_now_ns", diagnostics.predicted_now_ns},
+        {"predicted_future_loss_ns", diagnostics.predicted_future_loss_ns},
+        {"predicted_total_ns", diagnostics.predicted_total_ns},
+        {"targets_evaluated", diagnostics.targets_evaluated},
+        {"projection_work", diagnostics.projection_work},
+        {"planning_elapsed_ns", diagnostics.planning_elapsed_ns},
+        {"search_elapsed_ns", diagnostics.search_elapsed_ns},
+        {"stop_reason", ninfer::materialization_stop_reason_name(diagnostics.stop_reason)},
+        {"budget_exhausted", diagnostics.budget_exhausted},
+        {"selected_degradation_units", diagnostics.selected_degradation_units},
+        {"selected_maximal_fallback", diagnostics.selected_maximal_fallback},
+        {"best_reuse_prompt_tokens", diagnostics.best_reuse_prompt_tokens},
+        {"initial_predicted_total_ns", diagnostics.initial_predicted_total_ns},
+        {"first_improvement_ns", diagnostics.first_improvement_ns
+                                     ? Json(*diagnostics.first_improvement_ns)
+                                     : Json(nullptr)},
+        {"incumbent_improvements", diagnostics.incumbent_improvements},
+        {"search_work", diagnostics.search_work},
+        {"search_granted_ns", diagnostics.search_granted_ns},
+        {"search_renewals", diagnostics.search_renewals},
+        {"search_discovery_used", diagnostics.search_discovery_used},
+        {"search_overshoot_ns", diagnostics.search_overshoot_ns},
+        {"search_stop_phase",
+         ninfer::materialization_search_phase_name(diagnostics.search_stop_phase)},
+        {"search_boundary_limited", diagnostics.search_boundary_limited},
+    };
 }
 
 double nanoseconds_to_seconds(std::uint64_t value) noexcept {
@@ -372,12 +377,6 @@ double nanoseconds_to_seconds(std::uint64_t value) noexcept {
 
 double nanoseconds_to_microseconds(std::uint64_t value) noexcept {
     return static_cast<double>(value) * 1.0e-3;
-}
-
-double request_host_exposed_seconds(const ninfer::GenerationEngineTiming& timing) noexcept {
-    return timing.engine_boundary_exposed_seconds + timing.program_submit_exposed_seconds +
-           timing.program_post_exposed_seconds + timing.engine_commit_output_exposed_seconds +
-           timing.engine_maintenance_exposed_seconds;
 }
 
 Json request_engine_timing_json(const ninfer::GenerationEngineTiming& timing) {
@@ -391,40 +390,11 @@ Json request_engine_timing_json(const ninfer::GenerationEngineTiming& timing) {
               {"engine_maintenance", timing.engine_maintenance_exposed_seconds},
               {"total", request_host_exposed_seconds(timing)}}},
         {"device_wait_exposed_seconds", timing.device_wait_exposed_seconds},
-        {"constraint_draft_wait_exposed_seconds", timing.constraint_draft_wait_exposed_seconds},
         {"decode", Json{{"host_exposed_seconds", timing.decode_host_exposed_seconds},
                         {"device_wait_exposed_seconds", timing.decode_device_wait_exposed_seconds},
                         {"rounds", timing.decode_rounds}}},
         {"units", Json{{"prefill", timing.prefill_units}, {"control", timing.control_units}}},
     };
-}
-
-Json work_timing_json(const ninfer::GenerationWorkTiming& timing) {
-    return Json{{"submit_seconds", timing.submit_seconds},
-                {"wait_seconds", timing.wait_seconds},
-                {"post_seconds", timing.post_seconds},
-                {"gpu_seconds", timing.gpu_seconds}};
-}
-
-Json first_output_timing_json(const ninfer::GenerationFirstOutputTiming& timing) {
-    Json transfers = Json::object();
-    constexpr std::array resources{"state", "main_kv", "backend_kv"};
-    constexpr std::array directions{"d2h", "h2d", "d2d"};
-    for (std::size_t resource = 0; resource < resources.size(); ++resource) {
-        for (std::size_t direction = 0; direction < directions.size(); ++direction) {
-            const auto& transfer = timing.context_transfers[resource][direction];
-            transfers[resources[resource]][directions[direction]] =
-                Json{{"bytes", transfer.bytes}, {"seconds", transfer.seconds}};
-        }
-    }
-    return Json{{"elapsed_seconds", timing.elapsed_seconds},
-                {"initial_binding_seconds", timing.initial_binding_seconds},
-                {"engine", request_engine_timing_json(timing.engine)},
-                {"prefill", work_timing_json(timing.prefill)},
-                {"replay", work_timing_json(timing.replay)},
-                {"scheduling", scheduling_json(timing.scheduling)},
-                {"computed_prefill_tokens", timing.computed_prefill_tokens},
-                {"context_transfers", std::move(transfers)}};
 }
 
 ninfer::RuntimeHostWorkStats host_work_delta(const ninfer::RuntimeHostWorkStats& previous,
@@ -439,8 +409,6 @@ ninfer::RuntimeHostWorkStats host_work_delta(const ninfer::RuntimeHostWorkStats&
         .engine_maintenance_ns =
             monotonic_delta(previous.engine_maintenance_ns, current.engine_maintenance_ns),
         .device_wait_ns = monotonic_delta(previous.device_wait_ns, current.device_wait_ns),
-        .constraint_draft_wait_ns =
-            monotonic_delta(previous.constraint_draft_wait_ns, current.constraint_draft_wait_ns),
         .decode_host_ns = monotonic_delta(previous.decode_host_ns, current.decode_host_ns),
         .decode_device_wait_ns =
             monotonic_delta(previous.decode_device_wait_ns, current.decode_device_wait_ns),
@@ -452,8 +420,16 @@ ninfer::RuntimeHostWorkStats host_work_delta(const ninfer::RuntimeHostWorkStats&
             monotonic_delta(previous.control_device_wait_ns, current.control_device_wait_ns),
         .prefill_units = monotonic_delta(previous.prefill_units, current.prefill_units),
         .control_units = monotonic_delta(previous.control_units, current.control_units),
+        .admission_policy_ns =
+            monotonic_delta(previous.admission_policy_ns, current.admission_policy_ns),
+        .context_progress_ns =
+            monotonic_delta(previous.context_progress_ns, current.context_progress_ns),
         .stats_publication_ns =
             monotonic_delta(previous.stats_publication_ns, current.stats_publication_ns),
+        .admission_policy_invocations  = monotonic_delta(previous.admission_policy_invocations,
+                                                         current.admission_policy_invocations),
+        .context_progress_invocations  = monotonic_delta(previous.context_progress_invocations,
+                                                         current.context_progress_invocations),
         .stats_publication_invocations = monotonic_delta(previous.stats_publication_invocations,
                                                          current.stats_publication_invocations),
     };
@@ -486,34 +462,30 @@ std::string format_server_start_json(
         default_thinking_budget = *options.default_thinking_budget;
     }
 
-    record["server"] =
-        Json{{"host", options.host},
-             {"port", options.port},
-             {"public_model_id", public_model_id},
-             {"api_key_configured", !options.api_key.empty()},
-             {"cors_enabled", options.enable_cors},
-             {"max_request_bytes", options.max_request_bytes},
-             {"media_cache_bytes", options.media_cache_bytes},
-             {"media_live_bytes", options.media_live_bytes},
-             {"media_preprocess_threads", options.media_preprocess_threads},
-             {"request_log_jsonl", options.request_log_jsonl},
-             {"default_output_tokens", options.default_max_tokens},
-             {"default_thinking",
-              options.enable_thinking ? Json(*options.enable_thinking) : Json(nullptr)},
-             {"default_thinking_budget", std::move(default_thinking_budget)},
-             {"default_preserve_thinking",
-              options.preserve_thinking ? Json(*options.preserve_thinking) : Json(nullptr)}};
+    record["server"]                               = Json{{"host", options.host},
+                                                          {"port", options.port},
+                                                          {"public_model_id", public_model_id},
+                                                          {"api_key_configured", !options.api_key.empty()},
+                                                          {"cors_enabled", options.enable_cors},
+                                                          {"max_request_bytes", options.max_request_bytes},
+                                                          {"media_cache_bytes", options.media_cache_bytes},
+                                                          {"media_live_bytes", options.media_live_bytes},
+                                                          {"media_preprocess_threads", options.media_preprocess_threads},
+                                                          {"request_log_jsonl", options.request_log_jsonl},
+                                                          {"slot_save_path", options.slot_save_path},
+                                                          {"default_output_tokens", options.default_max_tokens},
+                                                          {"default_thinking", options.enable_thinking},
+                                                          {"default_thinking_budget", std::move(default_thinking_budget)},
+                                                          {"default_preserve_thinking", options.preserve_thinking}};
     record["artifact"]                             = Json{{"path", options.artifact_path},
                                                           {"size_bytes", std::move(artifact_size)},
-                                                          {"architecture", load.architecture},
-                                                          {"name", load.model_name},
-                                                          {"formats", load.weight_formats},
-                                                          {"prefill_signature", load.prefill_signature},
+                                                          {"target", load.target},
+                                                          {"weights_id", load.weights_id},
                                                           {"bytes_read", load.artifact_bytes_read},
                                                           {"host_to_device_bytes", load.host_to_device_bytes},
                                                           {"peak_staging_bytes", load.peak_staging_bytes},
-                                                          {"device_object_count", load.device_object_count},
-                                                          {"host_object_count", load.host_object_count},
+                                                          {"tensor_count", load.tensor_count},
+                                                          {"resource_count", load.resource_count},
                                                           {"load_seconds", load.load_seconds},
                                                           {"upload_seconds", load.upload_seconds}};
     const ninfer::ContextCacheOptions& cache       = engine_options.context_cache;
@@ -534,6 +506,12 @@ std::string format_server_start_json(
              {"prefill_chunk", engine_options.prefill_chunk},
              {"log_stats_interval_ms", options.log_stats_interval_ms},
              {"kv_cache", kv_cache_name(engine_options.kv_cache)},
+             // The mode in effect: NINFER_A16_PREFILL=1 forces A16 over the option (as the boot line says).
+             {"prefill_activations",
+              a16_prefill_env() ? "a16"
+                                : ninfer::prefill_activations_name(engine_options.prefill_activations)},
+             {"prefill_activations_option",
+              ninfer::prefill_activations_name(engine_options.prefill_activations)},
              {"vision", engine_options.enable_vision},
              {"cuda_graph", engine_options.use_cuda_graph},
              {"prefix_reuse", options.allow_prefix_reuse},
@@ -546,12 +524,21 @@ std::string format_server_start_json(
                                    {"prefill_source", ninfer::context_cost_preset_source_name(
                                                           context_cost.prefill_source)},
                                    {"hardware_class", context_cost.hardware_class},
-                                   {"prefill_signature", context_cost.prefill_signature},
+                                   {"model_id", context_cost.model_id},
+                                   {"weights_id", context_cost.weights_id},
                                    {"preset_path", context_cost.preset_path.string()}}},
-             {"context_cache", Json{{"enabled", cache.enabled},
-                                    {"device_state_slots", cache.device_state_slots.value()},
-                                    {"total_device_state_slots", total_device_state_slots},
-                                    {"host_capacity_bytes", cache.host_capacity_bytes.value()}}}};
+             {"context_cache",
+              Json{{"enabled", cache.enabled},
+                   {"device_state_slots", cache.device_state_slots.value()},
+                   {"total_device_state_slots", total_device_state_slots},
+                   {"host_state_slots", cache.host_state_slots},
+                   {"host_kv_capacity_bytes", cache.host_kv_capacity_bytes},
+                   {"max_private_continuations", cache.max_private_continuations.value()},
+                   {"max_shared_prefixes", cache.max_shared_prefixes.value()},
+                   {"max_long_anchors_per_continuation",
+                    cache.max_long_anchors_per_continuation.value()},
+                   {"automatic_private_anchors",
+                    resolve_automatic_private_anchors(options, cache)}}}};
     record["sampling_defaults"] =
         Json{{"thinking", preset_json(sampling_defaults.thinking)},
              {"non_thinking", preset_json(sampling_defaults.non_thinking)},
@@ -572,10 +559,9 @@ std::string format_server_start_json(
              {"planned_slack_bytes", memory.planned_slack_bytes},
              {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
              {"kv_payload_bytes", memory.kv_payload_bytes},
-             {"host_context_capacity_bytes", memory.host_context_capacity_bytes},
-             {"host_context_occupied_bytes", memory.host_context_occupied_bytes},
-             {"host_context_reserved_bytes", memory.host_context_reserved_bytes},
+             {"host_state_capacity_slots", memory.host_state_capacity_slots},
              {"host_state_occupied_slots", memory.host_state_occupied_slots},
+             {"host_kv_capacity_bytes", memory.host_kv_capacity_bytes},
              {"host_kv_occupied_bytes", memory.host_kv_occupied_bytes}};
     record["environment"] =
         Json{{"device", environment.device},
@@ -588,30 +574,6 @@ std::string format_server_start_json(
              {"cuda_runtime_version", environment.cuda_runtime_version},
              {"cuda_driver_version", environment.cuda_driver_version}};
     record["argv"] = options.startup_argv;
-    return record.dump();
-}
-
-std::string
-format_request_scheduling_json(const std::string& server_instance_id,
-                               std::uint64_t timestamp_unix_ms, std::uint64_t request_id,
-                               const std::string& http_request_id,
-                               const ninfer::GenerationSchedulingObservation& observation) {
-    Json record       = event_base(server_instance_id, timestamp_unix_ms, "request_scheduling");
-    record["request"] = Json{{"request_id", request_id}, {"http_request_id", http_request_id}};
-    record["engine_request_id"] = observation.engine_request_id;
-    record["transition"]        = scheduling_transition_name(observation.transition);
-    record["route"]             = recovery_route_json(observation.route);
-    record["steady_ns"]         = observation.steady_ns;
-    record["elapsed_ns"]        = observation.elapsed_ns;
-    record["preemption_index"]  = observation.preemption_index;
-    record["progress"]          = Json{
-                 {"global_prefill_tokens", observation.global_prefill_tokens},
-                 {"global_decode_tokens", observation.global_decode_tokens},
-                 {"global_replayed_tokens", observation.global_replayed_tokens},
-                 {"request_prefill_tokens", observation.request_prefill_tokens},
-                 {"request_decode_tokens", observation.request_decode_tokens},
-                 {"request_replayed_tokens", observation.request_replayed_tokens},
-    };
     return record.dump();
 }
 
@@ -642,8 +604,9 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         Json{{"finish_reason", finish_reason_name(outcome.finish_reason)},
              {"prompt_tokens", outcome.prompt_tokens},
              {"completion_tokens", outcome.completion_tokens},
-             {"generated_token_ids", outcome.generated_token_ids},
-             {"computed_prefill_tokens", outcome.metrics.computed_prefill_tokens},
+             {"computed_prefill_tokens",
+              std::max(0, outcome.prompt_tokens -
+                              static_cast<int>(outcome.metrics.prefix_cache_hit_tokens))},
              {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
              {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
              {"thinking_budget", outcome.thinking.configured_budget
@@ -658,16 +621,9 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
         {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
-    record["engine_timing"] = request_engine_timing_json(outcome.metrics.engine_timing);
-    record["constraint"]    = product::constraint_observation_json(outcome.constraint);
-    record["first_output_timing"] =
-        outcome.metrics.first_output_timing
-            ? first_output_timing_json(*outcome.metrics.first_output_timing)
-            : Json(nullptr);
-    record["speculative"] = speculative_json(outcome.metrics);
-    record["generation"]  = Json{{"engine_request_id", outcome.metrics.engine_request_id},
-                                 {"scheduling", scheduling_json(outcome.metrics.scheduling)},
-                                 {"admission", admission_json(outcome.metrics.admission)}};
+    record["engine_timing"]   = request_engine_timing_json(outcome.metrics.engine_timing);
+    record["speculative"]     = speculative_json(outcome.metrics);
+    record["materialization"] = materialization_json(outcome.metrics.materialization);
     return record.dump();
 }
 
@@ -702,26 +658,17 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
         host_work_delta(previous.host_work, current.host_work);
     const std::uint64_t active_host = host_active_ns(host);
     record["interval_seconds"]      = report.interval_seconds;
-    record["final_interval"]        = report.final_interval;
     record["tokens"]                = Json{{"computed_prefill", report.computed_prefill_tokens},
                                            {"committed_decode", report.committed_decode_tokens}};
     record["throughput_tokens_per_second"] =
         Json{{"prefill", prefill_rate}, {"decode", decode_rate}};
-    record["scheduler"]  = Json{{"running", current.running_requests},
-                                {"prefilling", current.prefilling_requests},
-                                {"decode_ready", current.decode_ready_requests},
-                                {"waiting", current.waiting_requests},
-                                {"paused", current.paused_requests},
-                                {"replaying", current.replaying_requests},
-                                {"materializing", current.materializing_requests},
-                                {"capture_pending", current.capture_pending_requests},
-                                {"terminal_pending", current.terminal_pending_requests}};
-    record["scheduling"] = Json{
-        {"preemptions", monotonic_delta(previous.preemptions, current.preemptions)},
-        {"snapshot_restores",
-         monotonic_delta(previous.snapshot_restores, current.snapshot_restores)},
-        {"replay_restores", monotonic_delta(previous.replay_restores, current.replay_restores)},
-        {"replayed_tokens", monotonic_delta(previous.replayed_tokens, current.replayed_tokens)}};
+    record["scheduler"]    = Json{{"running", current.running_requests},
+                                  {"prefilling", current.prefilling_requests},
+                                  {"decode_ready", current.decode_ready_requests},
+                                  {"waiting", current.waiting_requests},
+                                  {"materializing", current.materializing_requests},
+                                  {"capture_pending", current.capture_pending_requests},
+                                  {"terminal_pending", current.terminal_pending_requests}};
     record["decode_batch"] = Json{{"rounds", report.decode_rounds},
                                   {"row_rounds", report.decode_row_rounds},
                                   {"average_size", std::move(average_batch)}};
@@ -734,7 +681,6 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"engine_maintenance", nanoseconds_to_seconds(host.engine_maintenance_ns)},
                  {"total", nanoseconds_to_seconds(active_host)}}},
            {"device_wait_seconds", nanoseconds_to_seconds(host.device_wait_ns)},
-           {"constraint_draft_wait_seconds", nanoseconds_to_seconds(host.constraint_draft_wait_ns)},
            {"work_class_seconds",
             Json{{"decode_host", nanoseconds_to_seconds(host.decode_host_ns)},
                  {"decode_device_wait", nanoseconds_to_seconds(host.decode_device_wait_ns)},
@@ -743,8 +689,12 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"control_host", nanoseconds_to_seconds(host.control_host_ns)},
                  {"control_device_wait", nanoseconds_to_seconds(host.control_device_wait_ns)}}},
            {"detail_subset_seconds",
-            Json{{"stats_publication", nanoseconds_to_seconds(host.stats_publication_ns)}}},
-           {"detail_invocations", Json{{"stats_publication", host.stats_publication_invocations}}},
+            Json{{"admission_policy", nanoseconds_to_seconds(host.admission_policy_ns)},
+                 {"context_progress", nanoseconds_to_seconds(host.context_progress_ns)},
+                 {"stats_publication", nanoseconds_to_seconds(host.stats_publication_ns)}}},
+           {"detail_invocations", Json{{"admission_policy", host.admission_policy_invocations},
+                                       {"context_progress", host.context_progress_invocations},
+                                       {"stats_publication", host.stats_publication_invocations}}},
            {"units", Json{{"prefill", host.prefill_units}, {"control", host.control_units}}},
            {"decode_host_microseconds_per_round",
             microseconds_per(host.decode_host_ns, report.decode_rounds)},
@@ -753,7 +703,11 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
            {"decode_device_wait_microseconds_per_round",
             microseconds_per(host.decode_device_wait_ns, report.decode_rounds)},
            {"detail_microseconds_per_invocation",
-            Json{{"stats_publication",
+            Json{{"admission_policy",
+                  microseconds_per(host.admission_policy_ns, host.admission_policy_invocations)},
+                 {"context_progress",
+                  microseconds_per(host.context_progress_ns, host.context_progress_invocations)},
+                 {"stats_publication",
                   microseconds_per(host.stats_publication_ns, host.stats_publication_invocations)}}},
     };
     record["context_cache"] = Json{
@@ -763,16 +717,23 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                                                       current.active_captures_aborted)}}},
         {"selections",
          Json{{"root", monotonic_delta(previous.root_selections, current.root_selections)},
-              {"checkpoint",
-               monotonic_delta(previous.checkpoint_selections, current.checkpoint_selections)},
+              {"private_endpoint", monotonic_delta(previous.private_endpoint_selections,
+                                                   current.private_endpoint_selections)},
+              {"private_turn_closure", monotonic_delta(previous.private_turn_closure_selections,
+                                                       current.private_turn_closure_selections)},
+              {"private_response_replay",
+               monotonic_delta(previous.private_response_replay_selections,
+                               current.private_response_replay_selections)},
+              {"private_long_anchor", monotonic_delta(previous.private_long_anchor_selections,
+                                                      current.private_long_anchor_selections)},
+              {"shared_stable_prefix", monotonic_delta(previous.shared_stable_prefix_selections,
+                                                       current.shared_stable_prefix_selections)},
               {"reused_prompt_tokens",
                monotonic_delta(previous.reused_prompt_tokens, current.reused_prompt_tokens)}}},
         {"last_selection", Json{{"frontier_tokens", current.last_selected_frontier_tokens}}},
         {"state_operations",
          Json{{"moves", monotonic_delta(previous.state_moves, current.state_moves)},
               {"forks", monotonic_delta(previous.state_forks, current.state_forks)},
-              {"materialization_forks", monotonic_delta(previous.materialization_state_forks,
-                                                        current.materialization_state_forks)},
               {"restores", monotonic_delta(previous.state_restores, current.state_restores)}}},
         {"state_transfers",
          Json{{"d2h",
@@ -830,19 +791,36 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                            {"seconds", monotonic_delta(previous.backend_kv_d2d_seconds,
                                                        current.backend_kv_d2d_seconds)}}}}},
         {"pressure",
-         Json{{"spill_pages",
-               monotonic_delta(previous.pressure_spill_pages, current.pressure_spill_pages)},
-              {"partial_tail_cow_pages",
-               monotonic_delta(previous.partial_tail_cow_pages, current.partial_tail_cow_pages)}}},
-        {"occupancy",
-         Json{{"device_state_slots", current.device_state_occupied_slots},
-              {"host_state_slots", current.host_state_occupied_slots},
-              {"device_main_kv_pages", current.device_main_kv_occupied_pages},
-              {"device_backend_kv_pages", current.device_backend_kv_occupied_pages},
-              {"host_kv_bytes", current.host_kv_occupied_bytes},
-              {"host_context_occupied_bytes", current.host_context_occupied_bytes},
-              {"host_context_peak_occupied_bytes", current.host_context_peak_occupied_bytes},
-              {"host_context_reserved_bytes", current.host_context_reserved_bytes}}},
+         Json{
+             {"spill_pages",
+              monotonic_delta(previous.pressure_spill_pages, current.pressure_spill_pages)},
+             {"partial_tail_cow_pages",
+              monotonic_delta(previous.partial_tail_cow_pages, current.partial_tail_cow_pages)},
+             {"private_owners_degraded", monotonic_delta(previous.pressure_private_owners_degraded,
+                                                         current.pressure_private_owners_degraded)},
+             {"private_owners_evicted", monotonic_delta(previous.pressure_private_owners_evicted,
+                                                        current.pressure_private_owners_evicted)},
+             {"shared_owners_degraded", monotonic_delta(previous.pressure_shared_owners_degraded,
+                                                        current.pressure_shared_owners_degraded)},
+             {"shared_owners_evicted", monotonic_delta(previous.pressure_shared_owners_evicted,
+                                                       current.pressure_shared_owners_evicted)},
+             {"checkpoints_dropped", monotonic_delta(previous.pressure_checkpoints_dropped,
+                                                     current.pressure_checkpoints_dropped)},
+             {"searches", monotonic_delta(previous.pressure_searches, current.pressure_searches)},
+             {"search_budget_exhaustions",
+              monotonic_delta(previous.pressure_search_budget_exhaustions,
+                              current.pressure_search_budget_exhaustions)},
+             {"maximal_fallback_selections",
+              monotonic_delta(previous.pressure_maximal_fallback_selections,
+                              current.pressure_maximal_fallback_selections)},
+             {"historical_fork_hits",
+              monotonic_delta(previous.historical_fork_hits, current.historical_fork_hits)}}},
+        {"occupancy", Json{{"device_state_slots", current.device_state_occupied_slots},
+                           {"host_state_slots", current.host_state_occupied_slots},
+                           {"device_main_kv_pages", current.device_main_kv_occupied_pages},
+                           {"device_backend_kv_pages", current.device_backend_kv_occupied_pages},
+                           {"host_kv_bytes", current.host_kv_occupied_bytes},
+                           {"shared_active_references", current.shared_active_references}}},
         {"actual_transfer_seconds", monotonic_delta(previous.actual_context_transfer_seconds,
                                                     current.actual_context_transfer_seconds)}};
     return record.dump();
@@ -907,14 +885,6 @@ void JsonlRequestLog::write_server_start(const ServeOptions& options,
 void JsonlRequestLog::write_request_start(const RequestLogContext& context) {
     if (!enabled()) { return; }
     append(format_request_start_json(server_instance_id_, unix_time_ms(), context));
-}
-
-void JsonlRequestLog::write_request_scheduling(
-    std::uint64_t request_id, const std::string& http_request_id,
-    const ninfer::GenerationSchedulingObservation& observation) {
-    if (!enabled()) { return; }
-    append(format_request_scheduling_json(server_instance_id_, unix_time_ms(), request_id,
-                                          http_request_id, observation));
 }
 
 void JsonlRequestLog::write_request_rejected(const RequestRejectionLogContext& context) {

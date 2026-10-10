@@ -1,5 +1,4 @@
 #include "serve/openai_chat.h"
-#include "product/constraint_observation.h"
 
 #include "serve/generation_service.h"
 #include "serve/openai_common.h"
@@ -10,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -23,6 +23,22 @@ struct CompletionUsage {
     int completion_tokens = 0;
     int cached_tokens     = 0;
     int reasoning_tokens  = 0;
+
+    // llama.cpp-compatible `timings` block data, emitted so proxies like llama-swap can derive
+    // per-request Prefill/Decode rates and draft stats. has_timings gates emission; seconds
+    // values are wall-clock phase times.
+    bool has_timings              = false;
+    double prefill_seconds        = 0.0;
+    double decode_seconds         = 0.0;
+    double ttft_seconds           = 0.0;
+    std::uint64_t draft_tokens    = 0;
+    std::uint64_t accepted_tokens = 0;
+
+    // Slot identity emitted next to `timings`: the lane that served the request (id_slot >= 0)
+    // and its retained session's digest, the handle for /slots save preconditions. Both are
+    // omitted from payloads when absent.
+    int id_slot = -1;
+    std::string session_digest;
 };
 
 struct CompletionTimings {
@@ -130,14 +146,6 @@ const char* finish_reason(ninfer::FinishReason reason) {
     return "stop";
 }
 
-const char* finish_reason(const GenerationOutcome& outcome) {
-    const bool interrupted = outcome.finish_reason == ninfer::FinishReason::OutputLimit ||
-                             outcome.finish_reason == ninfer::FinishReason::ContextCapacity ||
-                             outcome.finish_reason == ninfer::FinishReason::Cancelled;
-    return !interrupted && !outcome.tool_calls.empty() ? "tool_calls"
-                                                       : finish_reason(outcome.finish_reason);
-}
-
 std::vector<ToolCall>
 materialize_tool_calls(const std::vector<ninfer::GeneratedToolCall>& generated) {
     std::vector<ToolCall> calls;
@@ -179,7 +187,23 @@ CompletionUsage usage_from(const GenerationOutcome& outcome) {
         .completion_tokens = outcome.completion_tokens,
         .cached_tokens     = static_cast<int>(outcome.metrics.prefix_cache_hit_tokens),
         .reasoning_tokens  = outcome.reasoning_tokens,
+        .has_timings       = true,
+        .prefill_seconds   = outcome.metrics.prefill_seconds,
+        .decode_seconds    = outcome.metrics.decode_seconds,
+        .ttft_seconds      = outcome.metrics.ttft_seconds,
+        .draft_tokens      = outcome.metrics.speculative_draft_tokens,
+        .accepted_tokens   = outcome.metrics.speculative_accepted_tokens,
+        .id_slot           = outcome.id_slot,
+        .session_digest    = outcome.session_digest,
     };
+}
+
+// llama.cpp-compatible `timings` block: consumed by proxies (llama-swap) to populate per-request
+// Which lane served the request and, when that lane retained the finished session, its digest -
+// what a client needs to target /slots operations safely.
+void add_slot_identity(Json& payload, const CompletionUsage& usage) {
+    if (usage.id_slot >= 0) { payload["id_slot"] = usage.id_slot; }
+    if (!usage.session_digest.empty()) { payload["session_digest"] = usage.session_digest; }
 }
 
 Json base_payload(const OpenAIChatResponseIdentity& identity, const char* object) {
@@ -199,22 +223,21 @@ Json stream_choice(Json delta, Json finish_reason = nullptr) {
 std::string event(Json payload) { return "data: " + payload.dump() + "\n\n"; }
 
 std::string chunk(const OpenAIChatResponseIdentity& identity, Json delta, Json finish_reason,
-                  bool include_usage, Json timings = nullptr, Json constraint = nullptr) {
+                  bool include_usage, Json timings = nullptr) {
     Json payload       = base_payload(identity, "chat.completion.chunk");
     payload["choices"] = Json::array({stream_choice(std::move(delta), std::move(finish_reason))});
     if (include_usage) { payload["usage"] = nullptr; }
     if (!timings.is_null()) { payload["timings"] = std::move(timings); }
-    if (!constraint.is_null()) payload["constraint"] = std::move(constraint);
     return event(std::move(payload));
 }
 
 std::string usage_chunk(const OpenAIChatResponseIdentity& identity, const CompletionUsage& usage,
-                        Json timings, Json constraint) {
+                        Json timings) {
     Json payload       = base_payload(identity, "chat.completion.chunk");
     payload["choices"] = Json::array();
     payload["usage"]   = usage_json(usage);
     payload["timings"] = std::move(timings);
-    if (!constraint.is_null()) payload["constraint"] = std::move(constraint);
+    add_slot_identity(payload, usage);
     return event(std::move(payload));
 }
 
@@ -248,14 +271,16 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
     }
 
     Json payload       = base_payload(identity, "chat.completion");
-    payload["choices"] = Json::array({Json{{"index", 0},
-                                           {"message", std::move(message)},
-                                           {"logprobs", nullptr},
-                                           {"finish_reason", Json(finish_reason(outcome))}}});
-    payload["usage"]   = usage_json(usage_from(outcome));
-    payload["timings"] = timings_json(outcome_timings(outcome));
-    if (outcome.constraint)
-        payload["constraint"] = product::constraint_observation_json(outcome.constraint);
+    payload["choices"] = Json::array(
+        {Json{{"index", 0},
+              {"message", std::move(message)},
+              {"logprobs", nullptr},
+              {"finish_reason",
+               has_tool_calls ? Json("tool_calls") : Json(finish_reason(outcome.finish_reason))}}});
+    const CompletionUsage usage = usage_from(outcome);
+    payload["usage"]            = usage_json(usage);
+    payload["timings"]          = timings_json(outcome_timings(outcome));
+    add_slot_identity(payload, usage);
     return payload.dump();
 }
 
@@ -362,7 +387,6 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
     require_prefix(outcome.reasoning, reasoning_, "reasoning");
     require_prefix(outcome.text, content_, "content");
 
-    const Json constraint     = product::constraint_observation_json(outcome.constraint);
     const Json final_timings  = timings_json(outcome_timings(outcome));
     const Json output_timings = timings_per_token_ ? final_timings : Json(nullptr);
     std::vector<std::string> events;
@@ -384,16 +408,14 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
         const std::vector<ToolCall> calls = materialize_tool_calls(outcome.tool_calls);
         events.push_back(chunk(identity_, Json{{"tool_calls", tool_calls_json(calls, true)}},
                                nullptr, include_usage_, output_timings));
-        events.push_back(chunk(identity_, Json::object(), finish_reason(outcome), include_usage_,
-                               include_usage_ ? Json(nullptr) : final_timings,
-                               include_usage_ ? Json(nullptr) : constraint));
+        events.push_back(chunk(identity_, Json::object(), "tool_calls", include_usage_,
+                               include_usage_ ? Json(nullptr) : final_timings));
     } else {
         events.push_back(chunk(identity_, Json::object(), finish_reason(outcome.finish_reason),
-                               include_usage_, include_usage_ ? Json(nullptr) : final_timings,
-                               include_usage_ ? Json(nullptr) : constraint));
+                               include_usage_, include_usage_ ? Json(nullptr) : final_timings));
     }
     if (include_usage_) {
-        events.push_back(usage_chunk(identity_, usage_from(outcome), final_timings, constraint));
+        events.push_back(usage_chunk(identity_, usage_from(outcome), final_timings));
     }
     events.emplace_back("data: [DONE]\n\n");
     return events;

@@ -22,21 +22,6 @@ void append_counter(std::string& out, const char* name, double value) {
 
 } // namespace
 
-void ServeMetrics::begin_request(std::uint64_t id, int prompt_tokens) {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    active_[id] = prompt_tokens > 0 ? prompt_tokens : 0;
-}
-
-void ServeMetrics::end_request(std::uint64_t id) {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    active_.erase(id);
-}
-
-std::vector<std::pair<std::uint64_t, int>> ServeMetrics::active_snapshot() const {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    return {active_.begin(), active_.end()};
-}
-
 void ServeMetrics::record(const GenerationOutcome& outcome) {
     const GenerationMetrics& m = outcome.metrics;
     const std::uint64_t cached = m.prefix_cache_hit_tokens;
@@ -61,9 +46,10 @@ ServeMetrics::LastCompleted ServeMetrics::last_completed() const {
 }
 
 std::string ServeMetrics::render(std::uint32_t max_concurrency,
-                                 const ninfer::RuntimeStats& live) const {
+                                 const ninfer::RuntimeStats& live,
+                                 std::size_t active_requests) const {
     const std::lock_guard<std::mutex> lock(mutex_);
-    const std::uint64_t in_flight  = active_.size();
+    const std::uint64_t in_flight  = active_requests;
     const std::uint64_t processing = std::min<std::uint64_t>(in_flight, max_concurrency);
     std::string out;
     out.reserve(704);

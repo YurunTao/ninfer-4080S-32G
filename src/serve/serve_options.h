@@ -22,11 +22,10 @@ inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
 struct ServeOptions {
     bool help_requested = false;
     std::string artifact_path;
-    std::filesystem::path chat_template_path;
     std::string host = "127.0.0.1";
     int port         = 8080;
     std::string api_key;                          // empty => no auth
-    std::optional<std::string> model_id_override; // unset => artifact metadata.name
+    std::optional<std::string> model_id_override; // unset => artifact identity.model_id
     std::string request_log_jsonl;                // empty => structured request logging disabled
     std::string slot_save_path;        // empty => /slots save/restore/erase disabled
     std::uint32_t max_context          = 8192;
@@ -41,13 +40,11 @@ struct ServeOptions {
     std::uint32_t turn_checkpoint_ring     = 0;
     bool deprecated_turn_checkpoints_given = false; // --turn-checkpoints was passed and ignored
     bool auto_save_evicted                 = false; // spill evicted sessions to their slot file
-    // On-disk session store. Enabled by --slot-save-path: write-once snapshots plus sidecars in
-    // that directory are indexed at startup, so a restarted server can resume them.
-    // --max-snapshot-disk-gib; 0 = unlimited. The default bounds an otherwise unbounded
-    // write-once snapshot directory.
-    std::uint64_t session_store_bytes = 20ULL << 30;
-    bool session_auto_restore         = false;     // --session-auto-restore
-    bool auto_save_on_stop            = false;     // --auto-save-on-stop
+    // --auto-long-anchors N: propose a private long anchor at each of the last N message
+    // boundaries of every prompt. Unset resolves to the retained-anchor cap
+    // (--max-long-anchors-per-continuation) once the Engine has normalized it; 0 disables.
+    // See resolve_automatic_private_anchors.
+    std::optional<std::uint32_t> auto_long_anchors;
     std::filesystem::path context_cost_presets;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
@@ -58,14 +55,18 @@ struct ServeOptions {
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
+    PrefillActivations prefill_activations = PrefillActivations::A16;
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;
     bool enable_vision              = false;
     std::uint32_t vision_max_tokens = 8192;
     bool use_cuda_graph             = true;
     bool allow_prefix_reuse = true;
-    std::optional<bool> enable_thinking;
-    std::optional<bool> preserve_thinking;
+    bool enable_thinking =
+        true; // default thinking mode for the generation prompt (--no-thinking opts out)
+    bool preserve_thinking = false;
+    // Recover complete Qwen tool calls from output the strict parser returns as text.
+    bool tolerant_tool_calls = false;
     std::optional<std::uint32_t> default_thinking_budget;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
@@ -81,8 +82,16 @@ struct ServeOptions {
 };
 
 ServeOptions parse_serve_options(int argc, char** argv);
+
+// The per-request ContextCacheHints::automatic_private_anchors value for this server: the
+// explicit --auto-long-anchors when given, else the resolved anchor cap, and never more than
+// that cap (extra proposals would only churn replacements within one prefill). Zero when the
+// context cache is disabled. `resolved` must be the Engine's normalized options, not the parsed
+// ServeOptions::context_cache, whose optionals are still unset.
+std::uint32_t resolve_automatic_private_anchors(const ServeOptions& options,
+                                                const ContextCacheOptions& resolved);
 std::string resolve_public_model_id(const ServeOptions& options,
-                                    std::string_view artifact_model_name);
+                                    std::string_view artifact_model_id);
 std::string serve_usage_text(const char* argv0);
 
 } // namespace ninfer::serve
