@@ -11,13 +11,16 @@
 namespace ninfer::ops::detail {
 
 __device__ __forceinline__ unsigned fp8_e4m3x2_to_bf16x2_bits(unsigned packed) {
-#if __CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)
-    // PTX 9.2 exposes the native pair widening on the project's sm_120a target.
+    // The native pair widening is PTX 9.2 on sm_90 and newer only; sm_89 keeps the
+    // exact FP16 bridge. Host passes never define __CUDA_ARCH__, so the guard also
+    // selects the bridge there, where only the prototype matters.
+#if (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && \
+    defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     unsigned result;
     asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(result) : "h"(static_cast<std::uint16_t>(packed)));
     return result;
 #else
-    // CUDA 13.1 retains the exact FP16 bridge.
+    // Exact FP16 bridge: E4M3 -> FP16 -> BF16 with no intermediate rounding loss.
     __nv_fp8x2_e4m3 fp8;
     fp8.__x                 = static_cast<std::uint16_t>(packed);
     const __half2 half_pair = static_cast<__half2>(fp8);

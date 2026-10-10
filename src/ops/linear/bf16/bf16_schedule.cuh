@@ -4,6 +4,13 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 
+// Build-level capability switch: 1 selects the sm_89 routes (no TMA, plain
+// row-major staging, cp.async pipelines). Defined for every internal target by
+// cmake/NinferTargets.cmake when the tree is configured for sm_89.
+#if !defined(NINFER_ARCH_SM89)
+#define NINFER_ARCH_SM89 0
+#endif
+
 namespace ninfer::ops::detail {
 
 enum class Bf16ActivationAccess : std::uint8_t {
@@ -197,7 +204,15 @@ template <int BlockRows, int BlockTokens, int BlockK, int WarpRows, int WarpToke
 struct Bf16A16TmaMmaSchedule
     : Bf16A16MmaSchedule<BlockRows, BlockTokens, BlockK, WarpRows, WarpTokens, Stages,
                          MinBlocksPerSm, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong,
-                         Raster, Bf16MmaSwizzle::Tma128, RasterGroupRows> {
+                         Raster,
+#if NINFER_ARCH_SM89
+                         // TMA's 128-byte swizzle is unavailable below sm_90; the sm_89
+                         // route stages plain row-major tiles with cp.async.
+                         Bf16MmaSwizzle::Plain,
+#else
+                         Bf16MmaSwizzle::Tma128,
+#endif
+                         RasterGroupRows> {
     static constexpr int kProducerThreads = 32;
     static constexpr int kConsumerWarps   = (BlockRows / WarpRows) * (BlockTokens / WarpTokens);
     static constexpr int kThreads         = kProducerThreads + kConsumerWarps * 32;

@@ -1,14 +1,14 @@
 #include "ninfer/ops/linear_add.h"
 
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
-#include "ops/linear/fp8/fp8_config.h"
+#include "ops/linear/fp8/fp8_geometry.h"
 #include "ops/linear/fp8/fp8_format.h"
-#include "ops/linear/nvfp4/nvfp4_config.h"
+#include "ops/linear/nvfp4/nvfp4_geometry.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
-#include "ops/linear_add/w8/w8_linear_add_plan.h"
+#include "ops/linear_add/q8/q8_linear_add_plan.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -26,7 +26,7 @@ void require_tensor(const Tensor& t, DType dtype, std::int32_t n0, std::int32_t 
 }
 
 void require_q5(const Weight& w) {
-    if (w.qtype != QType::Q5G64_F16S || w.layout != QuantLayout::RowSplit ||
+    if (w.qtype != QType::Q5_G64_FP16 || w.layout != QuantLayout::RowSplit ||
         w.scale_dtype != DType::FP16 || w.group_size != 64 || w.group != 64 ||
         w.padded_shape[0] != w.n || w.padded_shape[1] != w.k || w.qdata == nullptr ||
         w.qhigh == nullptr || w.scales == nullptr) {
@@ -35,7 +35,7 @@ void require_q5(const Weight& w) {
 }
 
 void require_w8(const Weight& w) {
-    if (w.qtype != QType::W8G32_F16S || w.layout != QuantLayout::RowSplit ||
+    if (w.qtype != QType::Q8_G32_FP16 || w.layout != QuantLayout::RowSplit ||
         w.scale_dtype != DType::FP16 || w.group_size != 32 || w.group != 32 ||
         w.padded_shape[0] != w.n || w.padded_shape[1] != w.k || w.qdata == nullptr ||
         w.qhigh != nullptr || w.scales == nullptr) {
@@ -44,7 +44,7 @@ void require_w8(const Weight& w) {
 }
 
 void require_bf16(const Weight& w) {
-    if (w.qtype != QType::BF16_CTRL || w.layout != QuantLayout::Contiguous || w.qdata == nullptr) {
+    if (w.qtype != QType::BF16 || w.layout != QuantLayout::Contiguous || w.qdata == nullptr) {
         throw std::invalid_argument("linear_add: weight must be contiguous BF16_CTRL");
     }
 }
@@ -85,7 +85,7 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("linear_add workspace: invalid token interval");
     }
-    if (qtype == QType::BF16_CTRL) {
+    if (qtype == QType::BF16) {
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("linear_add workspace: BF16 admits only A16");
         }
@@ -93,15 +93,15 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         (void)detail::bf16_linear_add_select(output_rows, input_rows, max_tokens);
         return 0;
     }
-    if (qtype == QType::W8G32_F16S) {
+    if (qtype == QType::Q8_G32_FP16) {
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("linear_add workspace: W8 admits only A16");
         }
-        (void)detail::w8_linear_add_resolve_plan({output_rows, input_rows, input_rows, min_tokens});
-        (void)detail::w8_linear_add_resolve_plan({output_rows, input_rows, input_rows, max_tokens});
+        (void)detail::q8_linear_add_resolve_plan({output_rows, input_rows, input_rows, min_tokens});
+        (void)detail::q8_linear_add_resolve_plan({output_rows, input_rows, input_rows, max_tokens});
         return 0;
     }
-    if (qtype == QType::Q5G64_F16S) {
+    if (qtype == QType::Q5_G64_FP16) {
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("linear_add workspace: Q5 admits only A16 or A8");
         }
@@ -109,21 +109,21 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
                                                               min_tokens, max_tokens, policy);
     }
     if (qtype == QType::NVFP4) {
-        const bool supported = (output_rows == detail::Nvfp4Residual6144Geometry::kOutputRows &&
-                                input_rows == detail::Nvfp4Residual6144Geometry::kInputRows) ||
-                               (output_rows == detail::Nvfp4Residual17408Geometry::kOutputRows &&
-                                input_rows == detail::Nvfp4Residual17408Geometry::kInputRows);
+        const bool supported = (output_rows == detail::Nvfp4N5120K6144::kOutputRows &&
+                                input_rows == detail::Nvfp4N5120K6144::kInputRows) ||
+                               (output_rows == detail::Nvfp4N5120K17408::kOutputRows &&
+                                input_rows == detail::Nvfp4N5120K17408::kInputRows);
         if (!supported || (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
             throw std::invalid_argument("linear_add workspace: unsupported NVFP4 profile");
         }
         return detail::nvfp4_linear_add_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                                  min_tokens, max_tokens);
     }
-    if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
-        const bool supported = (output_rows == detail::Fp8Residual6144Geometry::kOutputRows &&
-                                input_rows == detail::Fp8Residual6144Geometry::kInputRows) ||
-                               (output_rows == detail::Fp8Residual17408Geometry::kOutputRows &&
-                                input_rows == detail::Fp8Residual17408Geometry::kInputRows);
+    if (qtype == QType::FP8_E4M3FN_ROW_BF16) {
+        const bool supported = (output_rows == detail::Fp8N5120K6144::kOutputRows &&
+                                input_rows == detail::Fp8N5120K6144::kInputRows) ||
+                               (output_rows == detail::Fp8N5120K17408::kOutputRows &&
+                                input_rows == detail::Fp8N5120K17408::kInputRows);
         if (!supported || (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8)) {
             throw std::invalid_argument("linear_add workspace: unsupported FP8 profile");
         }
@@ -149,7 +149,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         throw std::invalid_argument("linear_add: x and residual_out must not overlap");
     }
 
-    if (w.qtype == QType::BF16_CTRL) {
+    if (w.qtype == QType::BF16) {
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("BF16 linear_add admits only A16");
         }
@@ -167,7 +167,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         return;
     }
 
-    if (w.qtype == QType::Q5G64_F16S) {
+    if (w.qtype == QType::Q5_G64_FP16) {
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("Q5 linear_add admits only A16 or A8");
         }
@@ -183,7 +183,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         return;
     }
 
-    if (w.qtype == QType::W8G32_F16S) {
+    if (w.qtype == QType::Q8_G32_FP16) {
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("W8 linear_add admits only A16");
         }
@@ -197,7 +197,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
                 "linear_add: W8 requires 16-byte x/residual/code/scale alignment");
         }
         (void)ws;
-        detail::w8_linear_add_dispatch(x, w, residual_out, stream);
+        detail::q8_linear_add_dispatch(x, w, residual_out, stream);
         return;
     }
 
@@ -206,10 +206,10 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument("NVFP4 linear_add admits only A16 or A4");
         }
         detail::validate_nvfp4_weight(w, "nvfp4 linear_add");
-        const bool supported_shape = (w.n == detail::Nvfp4Residual6144Geometry::kOutputRows &&
-                                      w.k == detail::Nvfp4Residual6144Geometry::kInputRows) ||
-                                     (w.n == detail::Nvfp4Residual17408Geometry::kOutputRows &&
-                                      w.k == detail::Nvfp4Residual17408Geometry::kInputRows);
+        const bool supported_shape = (w.n == detail::Nvfp4N5120K6144::kOutputRows &&
+                                      w.k == detail::Nvfp4N5120K6144::kInputRows) ||
+                                     (w.n == detail::Nvfp4N5120K17408::kOutputRows &&
+                                      w.k == detail::Nvfp4N5120K17408::kInputRows);
         if (!supported_shape) {
             throw std::invalid_argument("nvfp4 linear_add: unsupported weight shape");
         }
@@ -220,15 +220,15 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         return;
     }
 
-    if (w.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+    if (w.qtype == QType::FP8_E4M3FN_ROW_BF16) {
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("FP8 linear_add admits only A16 or A8");
         }
         (void)detail::validate_fp8_weight(w, "fp8 linear_add");
-        const bool supported_shape = (w.n == detail::Fp8Residual6144Geometry::kOutputRows &&
-                                      w.k == detail::Fp8Residual6144Geometry::kInputRows) ||
-                                     (w.n == detail::Fp8Residual17408Geometry::kOutputRows &&
-                                      w.k == detail::Fp8Residual17408Geometry::kInputRows);
+        const bool supported_shape = (w.n == detail::Fp8N5120K6144::kOutputRows &&
+                                      w.k == detail::Fp8N5120K6144::kInputRows) ||
+                                     (w.n == detail::Fp8N5120K17408::kOutputRows &&
+                                      w.k == detail::Fp8N5120K17408::kInputRows);
         if (!supported_shape) {
             throw std::invalid_argument("fp8 linear_add: unsupported weight shape");
         }

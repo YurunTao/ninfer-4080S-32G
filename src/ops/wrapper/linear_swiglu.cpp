@@ -5,7 +5,7 @@
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
-#include "ops/linear_swiglu/w8/w8_linear_swiglu_plan.h"
+#include "ops/linear_swiglu/q8/q8_linear_swiglu_plan.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -37,24 +37,24 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     if (min_tokens <= 0 || max_tokens < min_tokens || (gate_up_rows % 2) != 0) {
         throw std::invalid_argument("linear_swiglu workspace: invalid profile or token interval");
     }
-    if (qtype == QType::W8G32_F16S) {
+    if (qtype == QType::Q8_G32_FP16) {
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("linear_swiglu workspace: W8 admits only A16");
         }
-        (void)detail::w8_linear_swiglu_resolve_plan(
+        (void)detail::q8_linear_swiglu_resolve_plan(
             {gate_up_rows, gate_up_rows / 2, input_rows, input_rows, min_tokens});
-        (void)detail::w8_linear_swiglu_resolve_plan(
+        (void)detail::q8_linear_swiglu_resolve_plan(
             {gate_up_rows, gate_up_rows / 2, input_rows, input_rows, max_tokens});
         return 0;
     }
-    if (qtype == QType::Q4G64_F16S) {
+    if (qtype == QType::Q4_G64_FP16) {
         return detail::q4_linear_swiglu_capacity_workspace_bytes(
             gate_up_rows, gate_up_rows / 2, input_rows, input_rows, min_tokens, max_tokens, policy);
     }
     if (qtype == QType::NVFP4 && gate_up_rows == 34816 && input_rows == 5120) {
         return detail::nvfp4_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
-    if (qtype == QType::FP8_E4M3FN_ROW_BF16S && gate_up_rows == 34816 && input_rows == 5120) {
+    if (qtype == QType::FP8_E4M3FN_ROW_BF16 && gate_up_rows == 34816 && input_rows == 5120) {
         return detail::fp8_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
     throw std::invalid_argument("linear_swiglu workspace: unsupported weight format");
@@ -97,15 +97,15 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         gate_up_weight.shape[0] == gate_up_weight.n &&
         gate_up_weight.shape[1] == gate_up_weight.k && gate_up_weight.qdata != nullptr &&
         gate_up_weight.scales != nullptr;
-    const bool q4_weight = large_shape && gate_up_weight.qtype == QType::Q4G64_F16S &&
+    const bool q4_weight = large_shape && gate_up_weight.qtype == QType::Q4_G64_FP16 &&
                            gate_up_weight.group_size == 64 && gate_up_weight.group == 64 &&
                            common_row_split;
-    const bool w8_weight = (w8_shape || large_shape) && gate_up_weight.qtype == QType::W8G32_F16S &&
+    const bool w8_weight = (w8_shape || large_shape) && gate_up_weight.qtype == QType::Q8_G32_FP16 &&
                            gate_up_weight.group_size == 32 && gate_up_weight.group == 32 &&
                            gate_up_weight.qhigh == nullptr &&
                            gate_up_weight.high_plane_bytes == 0 && common_row_split;
     const bool nvfp4_weight = large_shape && gate_up_weight.qtype == QType::NVFP4;
-    const bool fp8_weight   = large_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16S;
+    const bool fp8_weight   = large_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
     if (!q4_weight && !w8_weight && !nvfp4_weight && !fp8_weight) {
         throw std::invalid_argument("linear_swiglu: unsupported weight");
     }
@@ -131,7 +131,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     }
 
     if (w8_weight) {
-        detail::w8_linear_swiglu_dispatch(x, gate_up_weight, out, stream);
+        detail::q8_linear_swiglu_dispatch(x, gate_up_weight, out, stream);
     } else {
         detail::q4_linear_swiglu_dispatch(x, gate_up_weight, out, ws, stream, policy);
     }
