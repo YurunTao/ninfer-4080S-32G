@@ -1,16 +1,21 @@
 cmake_minimum_required(VERSION 3.28)
 
-# The current implementation is compiled only for sm_120a. Set and validate the
-# architecture before CUDA compiler detection so CMake never injects a generic
-# host-toolchain default or accepts an unsupported target.
+# This branch is compiled only for sm_89 (RTX 4080 SUPER / RTX 4090). Set and
+# validate the architecture before CUDA compiler detection so CMake never injects
+# a generic host-toolchain default or accepts an unsupported target.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architectures to build")
+  set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures to build")
 endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "89")
   message(FATAL_ERROR
-    "NInfer supports only CMAKE_CUDA_ARCHITECTURES=120a; got "
+    "This branch supports only CMAKE_CUDA_ARCHITECTURES=89; got "
     "'${CMAKE_CUDA_ARCHITECTURES}'")
 endif()
+# Capability switch consumed by the ops build and the kernel sources: sm_120a
+# (Blackwell) kernels are unavailable here and are replaced by sm_89 routes.
+set(NINFER_ARCH_SM89 ON)
+set(NINFER_ARCH_HAS_TMA OFF)
+set(NINFER_ARCH_HAS_BLOCK_SCALE_MMA OFF)
 
 project(ninfer LANGUAGES C CXX CUDA)
 
@@ -26,6 +31,16 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)        # clangd / IDE tooling
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
+endif()
+
+if(MSVC)
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+  add_compile_options(
+    $<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+  # CUDA's static runtime requests LIBCMT even when the application and vcpkg dependencies use
+  # the project-wide /MD runtime. Keep one CRT in the final process.
+  add_link_options(/NODEFAULTLIB:LIBCMT)
 endif()
 
 if(CMAKE_GENERATOR MATCHES "Ninja")

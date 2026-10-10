@@ -5,6 +5,14 @@
 #include <filesystem>
 #include <span>
 
+#if defined(_WIN32)
+using ninfer_native_file_t = void*;
+#define NINFER_INVALID_FILE nullptr
+#else
+using ninfer_native_file_t = int;
+#define NINFER_INVALID_FILE (-1)
+#endif
+
 namespace ninfer::artifact {
 
 // Direct reads require aligned offsets and buffers. A short final direct block is allowed;
@@ -24,9 +32,9 @@ public:
 
 private:
     std::filesystem::path path_;
-    int fd_                = -1;
-    mutable int direct_fd_ = -1;
-    std::uint64_t bytes_   = 0;
+    ninfer_native_file_t fd_                = NINFER_INVALID_FILE;
+    mutable ninfer_native_file_t direct_fd_ = NINFER_INVALID_FILE;
+    std::uint64_t bytes_                    = 0;
 };
 
 } // namespace ninfer::artifact
