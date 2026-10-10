@@ -85,6 +85,9 @@ public:
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
+    // Capabilities advertised by the chat template embedded in the loaded artifact. Serving
+    // resolves protocol-level template options against these instead of guessing.
+    [[nodiscard]] PromptCapabilities prompt_capabilities() const;
     [[nodiscard]] ModelSamplingDefaults sampling_defaults() const;
 
     // Establishes queue membership synchronously with a fixed output consumer mode. Destroying an

@@ -111,11 +111,64 @@ std::string render_tool_definition(const ToolDefinition& tool) {
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& request,
                                                  const ServeOptions& server,
                                                  const ninfer::PromptCapabilities& capabilities) {
+    // The protocol-level fields and the template-parameter object are two views of the same
+    // options. Fold them together first: an explicit typed field and a nested template parameter
+    // may not disagree, and the nested value fills in any field the client left unset.
+    using Json  = RequestJson;
+    Json kwargs = request.chat_template_kwargs_json.empty()
+                      ? Json::object()
+                      : Json::parse(request.chat_template_kwargs_json);
+    if (!kwargs.is_object()) {
+        invalid_prompt_option("chat_template_kwargs must be an object", "chat_template_kwargs",
+                              "invalid_template_option");
+    }
+    const auto merge_boolean = [&](const char* key, std::optional<bool> typed) {
+        if (!kwargs.contains(key) || kwargs[key].is_null()) {
+            kwargs.erase(key);
+            return typed;
+        }
+        if (!kwargs[key].is_boolean()) {
+            invalid_prompt_option(std::string(key) + " must be a boolean", key,
+                                  "invalid_template_option");
+        }
+        const bool nested = kwargs[key].get<bool>();
+        if (typed && *typed != nested) {
+            invalid_prompt_option(std::string("conflicting ") + key + " values", key,
+                                  "conflicting_template_option");
+        }
+        kwargs.erase(key);
+        return std::optional<bool>(nested);
+    };
+    const std::optional<bool> requested_enable_thinking =
+        merge_boolean("enable_thinking", request.enable_thinking);
+    const std::optional<bool> requested_preserve_thinking =
+        merge_boolean("preserve_thinking", request.preserve_thinking);
+    std::optional<RequestedReasoningEffort> requested_effort = request.reasoning_effort;
+    if (kwargs.contains("reasoning_effort") && !kwargs["reasoning_effort"].is_null()) {
+        if (!kwargs["reasoning_effort"].is_string()) {
+            invalid_prompt_option("reasoning_effort must be a string", "reasoning_effort",
+                                  "invalid_template_option");
+        }
+        const auto nested =
+            parse_requested_reasoning_effort(kwargs["reasoning_effort"].get<std::string>());
+        if (!nested) {
+            invalid_prompt_option("invalid reasoning_effort", "reasoning_effort",
+                                  "invalid_template_option");
+        }
+        if (requested_effort && requested_effort != nested) {
+            invalid_prompt_option("conflicting reasoning_effort values", "reasoning_effort",
+                                  "conflicting_template_option");
+        }
+        requested_effort = nested;
+    }
+    kwargs.erase("reasoning_effort");
+
     ResolvedPromptSemantics result{
-        .enable_thinking            = request.enable_thinking.value_or(server.enable_thinking),
+        .enable_thinking = requested_enable_thinking.value_or(server.enable_thinking),
         .reasoning_effort           = std::nullopt,
         .effective_reasoning_effort = std::nullopt,
-        .preserve_thinking          = request.preserve_thinking.value_or(server.preserve_thinking),
+        .preserve_thinking = requested_preserve_thinking.value_or(server.preserve_thinking),
+        .chat_template_kwargs_json = kwargs.dump(),
     };
     const auto complete = [&]() {
         if (request.continuation == ninfer::PromptContinuationMode::ContinueFinalAssistant &&
@@ -130,11 +183,11 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         }
         return result;
     };
-    if (!request.reasoning_effort) { return complete(); }
+    if (!requested_effort) { return complete(); }
 
-    const RequestedReasoningEffort requested = *request.reasoning_effort;
+    const RequestedReasoningEffort requested = *requested_effort;
     const bool enables_thinking              = requested != RequestedReasoningEffort::None;
-    if (request.enable_thinking && *request.enable_thinking != enables_thinking) {
+    if (requested_enable_thinking && *requested_enable_thinking != enables_thinking) {
         invalid_prompt_option("reasoning effort conflicts with enable_thinking", "reasoning_effort",
                               "conflicting_template_option");
     }
@@ -274,8 +327,9 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
 
     input.options.continuation                     = request.continuation;
     input.options.enable_thinking                  = semantics.enable_thinking;
-    input.options.reasoning_effort                 = semantics.reasoning_effort;
+    input.options.reasoning_effort                 = semantics.effective_reasoning_effort;
     input.options.preserve_thinking                = semantics.preserve_thinking;
+    input.options.chat_template_kwargs_json        = semantics.chat_template_kwargs_json;
     input.options.add_vision_id                    = false;
     const std::vector<const ToolDefinition*> tools = effective_tools(request);
     input.options.tool_jsons.reserve(tools.size());
@@ -300,6 +354,8 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
                                           const ResolvedPromptSemantics& semantics,
                                           bool allow_prefix_reuse) {
     ninfer::RequestOptions options;
+    options.constraint                        = request.constraint;
+    options.tool_choice                       = request.tool_choice;
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = allow_prefix_reuse;
     if (semantics.enable_thinking) {
@@ -308,7 +364,8 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     }
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;
-    options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
+    options.output.preserve_special_tokens = !request.constraint && !request.constrains_tools() &&
+                                             (request.uses_tools() || request.has_tool_history());
     options.output.tool_name_max_length = static_cast<std::uint32_t>(request.tool_name_max_length);
     options.output.tolerant_tool_calls  = server.tolerant_tool_calls;
     options.stop.strings.reserve(request.stop_strings.size() *

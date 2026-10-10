@@ -266,7 +266,7 @@ public:
 
     // Fork-local (session persistence): read access to a published Host replica so a snapshot
     // can serialize a demoted StateImage without forcing it back onto the device.
-    [[nodiscard]] qwen3_6::HostStateImageConstView host_view(StateImageHandle handle) const {
+    [[nodiscard]] qwen3_5::HostStateImageConstView host_view(StateImageHandle handle) const {
         const Object& object = require(handle);
         if (host_ == nullptr || !object.host_slot) {
             throw std::logic_error("StateImage has no published Host replica");
@@ -279,7 +279,7 @@ public:
     // checkpoints without a free Device slot. Returns nullopt when the Host pool is absent or
     // full.
     [[nodiscard]] std::optional<StateImageHandle>
-    adopt_host_image(const qwen3_6::HostStateImageConstView& source) {
+    adopt_host_image(const qwen3_5::HostStateImageConstView& source) {
         if (host_ == nullptr || source.data == nullptr || source.layout == nullptr ||
             source.layout->image_bytes != host_->layout().image_bytes) {
             return std::nullopt;
@@ -287,7 +287,7 @@ public:
         std::optional<StateImageHandle> handle =
             allocate(StateImageRole::CheckpointImmutable, false);
         if (!handle) { return std::nullopt; }
-        std::optional<qwen3_6::HostStateSlotHandle> slot = host_->allocate();
+        std::optional<qwen3_5::HostStateSlotHandle> slot = host_->allocate();
         if (!slot) {
             (void)release(*handle);
             return std::nullopt;
@@ -427,17 +427,6 @@ public:
         destination_object.role               = StateImageRole::ReservedDestination;
         destination_object.content_epoch      = 0;
         retire_released_owner(source);
-    }
-
-    [[nodiscard]] bool can_abort_fork(StateImageHandle source,
-                                      StateImageHandle destination) const noexcept {
-        if (!valid(source) || !valid(destination)) { return false; }
-        const Object& source_object      = objects_[source.index_];
-        const Object& destination_object = objects_[destination.index_];
-        return source != destination && source_object.role == StateImageRole::CheckpointImmutable &&
-               source_object.source_pins != 0 &&
-               destination_object.role == StateImageRole::ActiveMutable &&
-               destination_object.device_slot.has_value() && destination_object.destination_pinned;
     }
 
     [[nodiscard]] bool can_abort_fork(StateImageHandle source,

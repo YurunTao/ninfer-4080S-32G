@@ -18,12 +18,20 @@ using MediaAcquirer = std::function<ninfer::OwnedMedia(const ContentPart&)>;
 struct ResolvedPromptSemantics {
     std::optional<bool> enable_thinking;
     std::optional<ninfer::ReasoningEffort> reasoning_effort;
+    // Effort tier the selected chat template can actually execute. Equal to reasoning_effort when
+    // the template supports it; otherwise the nearest supported tier, or unset when thinking is
+    // disabled. Serve reports this resolved value; only this one reaches the Engine.
+    std::optional<ninfer::ReasoningEffort> effective_reasoning_effort;
     std::optional<bool> preserve_thinking;
     std::string chat_template_kwargs_json;
 };
 
+// Effort resolution is capability-aware: the fork resolves each requested tier against the
+// capabilities advertised by the chat template embedded in the loaded artifact instead of passing
+// an unsupported tier through to the template.
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& req,
-                                                 const ServeOptions& server);
+                                                 const ServeOptions& server,
+                                                 const ninfer::PromptCapabilities& capabilities);
 
 ninfer::PromptInput to_prompt_input(const GenerationRequest& req,
                                     const ResolvedPromptSemantics& semantics,

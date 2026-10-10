@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "core/weight.h"
 
 #include <cuda_runtime.h>
 

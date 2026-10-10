@@ -18,8 +18,6 @@ namespace ninfer::models::qwen3_5::frontend {
 
 inline constexpr std::string_view kCanonicalReasoningCloseSerialization = "\n</think>\n\n";
 
-inline constexpr std::string_view kCanonicalReasoningCloseSerialization = "\n</think>\n\n";
-
 struct ToolCall {
     std::string id;
     std::string name;

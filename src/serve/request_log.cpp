@@ -117,31 +117,50 @@ std::string tool_choice_name(const ToolChoice& choice) {
         return "auto";
     case ToolChoiceMode::None:
         return "none";
+    case ToolChoiceMode::Required:
+        return "required";
     }
     return "unknown";
 }
 
-const char* reasoning_effort_name(ninfer::ReasoningEffort effort) {
-    switch (effort) {
-    case ninfer::ReasoningEffort::Low:
-        return "low";
-    case ninfer::ReasoningEffort::Medium:
-        return "medium";
-    case ninfer::ReasoningEffort::XHigh:
-        return "xhigh";
+const char* scheduling_transition_name(ninfer::GenerationSchedulingTransition transition) {
+    using Transition = ninfer::GenerationSchedulingTransition;
+    switch (transition) {
+    case Transition::PauseStarted:
+        return "pause_started";
+    case Transition::Paused:
+        return "paused";
+    case Transition::RestoreStarted:
+        return "restore_started";
+    case Transition::Restored:
+        return "restored";
+    case Transition::ReplayComplete:
+        return "replay_complete";
+    case Transition::RecoveryComplete:
+        return "recovery_complete";
+    case Transition::SnapshotRevoked:
+        return "snapshot_revoked";
+    case Transition::Terminal:
+        return "terminal";
     }
-    return "unknown";
+    throw std::logic_error("invalid scheduling transition");
+}
+
+Json recovery_route_json(ninfer::GenerationRecoveryRoute route) {
+    switch (route) {
+    case ninfer::GenerationRecoveryRoute::None:
+        return nullptr;
+    case ninfer::GenerationRecoveryRoute::Snapshot:
+        return "snapshot";
+    case ninfer::GenerationRecoveryRoute::Replay:
+        return "replay";
+    }
+    throw std::logic_error("invalid recovery route");
 }
 
 Json requested_reasoning_effort_json(const std::optional<RequestedReasoningEffort>& requested) {
     return requested ? Json(std::string(requested_reasoning_effort_name(*requested)))
                      : Json(nullptr);
-}
-
-Json resolved_reasoning_effort_json(bool enable_thinking,
-                                    const std::optional<ninfer::ReasoningEffort>& resolved) {
-    if (!enable_thinking) { return "none"; }
-    return resolved ? Json(reasoning_effort_name(*resolved)) : Json(nullptr);
 }
 
 const char* kv_cache_name(ninfer::KvCacheStorage storage) {
@@ -180,6 +199,8 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
     switch (path) {
     case ninfer::PrefixReusePath::Root:
         return "root";
+    case ninfer::PrefixReusePath::Checkpoint:
+        return "checkpoint";
     case ninfer::PrefixReusePath::PrivateEndpoint:
         return "private_endpoint";
     case ninfer::PrefixReusePath::PrivateTurnClosure:
@@ -258,9 +279,6 @@ Json request_json(const RequestLogContext& context) {
                 {"thinking_budget", std::move(thinking_budget)},
                 {"requested_reasoning_effort",
                  requested_reasoning_effort_json(context.requested_reasoning_effort)},
-                {"resolved_reasoning_effort",
-                 resolved_reasoning_effort_json(context.enable_thinking,
-                                                context.resolved_reasoning_effort)},
                 {"preserve_thinking", context.preserve_thinking},
                 {"preserve_thinking_semantic_change", context.preserve_thinking_semantic_change},
                 {"sampling", sampler_json(context.sampling)}};
@@ -577,6 +595,30 @@ std::string format_server_start_json(
     return record.dump();
 }
 
+std::string
+format_request_scheduling_json(const std::string& server_instance_id,
+                               std::uint64_t timestamp_unix_ms, std::uint64_t request_id,
+                               const std::string& http_request_id,
+                               const ninfer::GenerationSchedulingObservation& observation) {
+    Json record       = event_base(server_instance_id, timestamp_unix_ms, "request_scheduling");
+    record["request"] = Json{{"request_id", request_id}, {"http_request_id", http_request_id}};
+    record["engine_request_id"] = observation.engine_request_id;
+    record["transition"]        = scheduling_transition_name(observation.transition);
+    record["route"]             = recovery_route_json(observation.route);
+    record["steady_ns"]         = observation.steady_ns;
+    record["elapsed_ns"]        = observation.elapsed_ns;
+    record["preemption_index"]  = observation.preemption_index;
+    record["progress"]          = Json{
+                 {"global_prefill_tokens", observation.global_prefill_tokens},
+                 {"global_decode_tokens", observation.global_decode_tokens},
+                 {"global_replayed_tokens", observation.global_replayed_tokens},
+                 {"request_prefill_tokens", observation.request_prefill_tokens},
+                 {"request_decode_tokens", observation.request_decode_tokens},
+                 {"request_replayed_tokens", observation.request_replayed_tokens},
+    };
+    return record.dump();
+}
+
 std::string format_request_start_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp, const RequestLogContext& context) {
     Json record                   = event_base(server_instance_id, timestamp, "request_start");
@@ -885,6 +927,14 @@ void JsonlRequestLog::write_server_start(const ServeOptions& options,
 void JsonlRequestLog::write_request_start(const RequestLogContext& context) {
     if (!enabled()) { return; }
     append(format_request_start_json(server_instance_id_, unix_time_ms(), context));
+}
+
+void JsonlRequestLog::write_request_scheduling(
+    std::uint64_t request_id, const std::string& http_request_id,
+    const ninfer::GenerationSchedulingObservation& observation) {
+    if (!enabled()) { return; }
+    append(format_request_scheduling_json(server_instance_id_, unix_time_ms(), request_id,
+                                          http_request_id, observation));
 }
 
 void JsonlRequestLog::write_request_rejected(const RequestRejectionLogContext& context) {

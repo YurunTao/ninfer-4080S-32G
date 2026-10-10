@@ -275,6 +275,21 @@ void HttpServer::record_request_rejected(const RequestRejectionLogContext& conte
     operational_log_.request_rejected(context);
 }
 
+ninfer::GenerationFirstTokenObserver HttpServer::first_token_observer() {
+    return [this](const ninfer::GenerationFirstTokenObservation& observation) {
+        metrics_.first_token(observation);
+    };
+}
+
+ninfer::GenerationSchedulingObserver HttpServer::scheduling_observer(std::uint64_t request_id,
+                                                                    std::string http_request_id) {
+    if (!request_jsonl_.enabled()) { return {}; }
+    return [this, request_id, http_request_id = std::move(http_request_id)](
+               const ninfer::GenerationSchedulingObservation& observation) {
+        request_jsonl_.write_request_scheduling(request_id, http_request_id, observation);
+    };
+}
+
 void HttpServer::record_request_done(const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
     request_jsonl_.write_request_done(context, outcome);

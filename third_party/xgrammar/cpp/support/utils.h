@@ -358,8 +358,10 @@ class Result {
 
 // Sometimes GCC fails to detect some branches will not return, such as when we use LOG(FATAL)
 // to raise an error. This macro manually mark them as unreachable to avoid warnings.
-#ifdef __GNUC__
+#if defined(__GNUC__)
 #define XGRAMMAR_UNREACHABLE() __builtin_unreachable()
+#elif defined(_MSC_VER)
+#define XGRAMMAR_UNREACHABLE() __assume(false)
 #else
 #define XGRAMMAR_UNREACHABLE()
 #endif

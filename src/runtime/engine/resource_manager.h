@@ -2,7 +2,7 @@
 
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
-#include "runtime/engine/context_cost.h"
+#include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/materialization_planner.h"
 #include "runtime/engine/shared_capture_planner.h"
 

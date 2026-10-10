@@ -91,6 +91,11 @@ private:
     void handle_slot_action(const httplib::Request& req, httplib::Response& res);
 
     void record_request_start(const RequestLogContext& context);
+    // Engine observation hooks. The scheduling hook forwards sparse lifecycle records into the
+    // JSONL measurement log; the first-token hook feeds the TTFT histogram.
+    [[nodiscard]] ninfer::GenerationSchedulingObserver
+    scheduling_observer(std::uint64_t request_id, std::string http_request_id);
+    [[nodiscard]] ninfer::GenerationFirstTokenObserver first_token_observer();
     void record_request_rejected(const RequestRejectionLogContext& context);
     void record_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void record_request_failure(const RequestLogContext& context, const RequestFailure& failure);

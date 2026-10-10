@@ -45,6 +45,14 @@ ServeMetrics::LastCompleted ServeMetrics::last_completed() const {
     return last_completed_;
 }
 
+void ServeMetrics::first_token(const ninfer::GenerationFirstTokenObservation& observation) {
+    const double seconds = observation.prepare_seconds + observation.elapsed_since_submit_seconds;
+    if (!(seconds >= 0.0)) { return; }
+    const std::lock_guard<std::mutex> lock(mutex_);
+    time_to_first_token_seconds_sum_ += seconds;
+    time_to_first_token_samples_ += 1;
+}
+
 std::string ServeMetrics::render(std::uint32_t max_concurrency,
                                  const ninfer::RuntimeStats& live,
                                  std::size_t active_requests) const {
@@ -63,6 +71,8 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency,
     append_counter(out, "ninfer:prefix_cache_hit_tokens_total", prefix_cache_hit_tokens_total_);
     append_counter(out, "ninfer:draft_tokens_total", speculative_draft_tokens_total_);
     append_counter(out, "ninfer:draft_accepted_tokens_total", speculative_accepted_tokens_total_);
+    append_counter(out, "ninfer:time_to_first_token_seconds_sum", time_to_first_token_seconds_sum_);
+    append_counter(out, "ninfer:time_to_first_token_seconds_count", time_to_first_token_samples_);
     return out;
 }
 

@@ -15,6 +15,13 @@ add_library(ninfer_engine STATIC
 )
 ninfer_internal_includes(ninfer_engine)
 target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
+# The engine core consumes the family's exported interface headers through their
+# installed-style path (ninfer/targets/<target>/...); the packages keep them in
+# per-target export trees rather than in include/, so those are added here.
+target_include_directories(ninfer_engine PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export)
 target_link_libraries(ninfer_engine PRIVATE
   ninfer_model_runtime
   ninfer_artifact

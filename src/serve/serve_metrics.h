@@ -27,6 +27,11 @@ public:
     // request-done log line, so every protocol and both streaming modes count.
     void record(const GenerationOutcome& outcome);
 
+    // One first-token observation per admitted request, delivered by the Engine's first-token
+    // hook. The elapsed fields are exactly the ones the request's preparation/submission
+    // boundaries produced, so the sum stays a real latency total.
+    void first_token(const ninfer::GenerationFirstTokenObservation& observation);
+
     // Prompt/cache sizes of the most recent completed request, retained for
     // /slots. llama.cpp keeps the last request's counts on an idle slot and
     // scrapers (the fleet dashboard) read them as the resident session
@@ -54,6 +59,8 @@ private:
     std::uint64_t prefix_cache_hit_tokens_total_     = 0;
     std::uint64_t speculative_draft_tokens_total_    = 0;
     std::uint64_t speculative_accepted_tokens_total_ = 0;
+    double time_to_first_token_seconds_sum_          = 0.0;
+    std::uint64_t time_to_first_token_samples_       = 0;
     LastCompleted last_completed_;
 };
 

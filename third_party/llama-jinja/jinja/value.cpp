@@ -281,7 +281,12 @@ const func_builtins& global_builtins() {
              args.ensure_vals<value_string>();
              std::string format = args.get_pos(0)->as_string().str();
              std::tm local{};
-             if (!localtime_r(&args.ctx.current_time, &local)) {
+#ifdef _WIN32
+             const bool valid = _localtime64_s(&local, &args.ctx.current_time) == 0;
+#else
+             const bool valid = localtime_r(&args.ctx.current_time, &local) != nullptr;
+#endif
+             if (!valid) {
                  throw raised_exception("strftime_now: invalid time");
              }
              if (format.empty()) return mk_val<value_string>("");

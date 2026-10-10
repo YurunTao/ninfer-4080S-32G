@@ -205,28 +205,50 @@ public:
     explicit ServiceOutputSink(const StreamSink& sink) : sink_(&sink) {}
 
     void start(ninfer::GenerationStart start) override {
-        if (sink_->on_start) { sink_->on_start(start); }
+        deliver([&] {
+            if (sink_->on_start) { sink_->on_start(start); }
+        });
     }
 
     void progress(ninfer::PromptProgress progress) override {
-        if (sink_->on_progress) { sink_->on_progress(progress); }
+        deliver([&] {
+            if (sink_->on_progress) { sink_->on_progress(progress); }
+        });
     }
 
     void timing(ninfer::GenerationTimingObservation timing) override {
-        if (sink_->on_timing) { sink_->on_timing(timing); }
+        deliver([&] {
+            if (sink_->on_timing) { sink_->on_timing(timing); }
+        });
     }
 
     void publish(ninfer::OutputDelta delta) override {
         if (delta.text.empty()) { return; }
-        if (delta.channel == ninfer::OutputChannel::Reasoning) {
-            if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
-        } else {
-            if (sink_->on_content) { sink_->on_content(delta.text); }
-        }
+        deliver([&] {
+            if (delta.channel == ninfer::OutputChannel::Reasoning) {
+                if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
+            } else {
+                if (sink_->on_content) { sink_->on_content(delta.text); }
+            }
+        });
     }
 
+    [[nodiscard]] bool disconnected() const noexcept { return disconnected_; }
+
 private:
+    // A transport that reports the client going away must not abort the request: the Engine
+    // still settles it and reports the work actually performed. Remember the disconnection so
+    // the awaiting caller can cancel the remaining work while keeping those statistics.
+    template <class Callback>
+    void deliver(Callback&& callback) {
+        if (disconnected_) { return; }
+        try {
+            callback();
+        } catch (const ClientDisconnected&) { disconnected_ = true; }
+    }
+
     const StreamSink* sink_ = nullptr;
+    bool disconnected_      = false;
 };
 
 } // namespace
@@ -336,10 +358,10 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         resolve_prompt_semantics(request, options_, prompt_capabilities_);
     ninfer::RequestOptions request_options = to_request_options(
         request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
-    prepared.enable_thinking            = semantics.enable_thinking;
-    prepared.thinking_budget            = request_options.execution.thinking.budget;
-    prepared.effective_reasoning_effort = semantics.effective_reasoning_effort;
-    prepared.preserve_thinking          = semantics.preserve_thinking;
+    prepared.enable_thinking = semantics.enable_thinking.value_or(options_.enable_thinking);
+    prepared.thinking_budget = request_options.execution.thinking.budget;
+    prepared.reasoning_effort = semantics.effective_reasoning_effort;
+    prepared.preserve_thinking = semantics.preserve_thinking;
     const bool request_has_media        = request.media_item_count() != 0;
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
@@ -437,13 +459,11 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     std::unique_ptr<ServiceOutputSink> output_sink;
     if (sink != nullptr) { output_sink = std::make_unique<ServiceOutputSink>(*sink); }
     ninfer::OutputSink* public_sink = output_sink.get();
-    ninfer::CancellationView cancellation;
-    if (is_cancelled || (sink != nullptr && sink->is_cancelled)) {
-        cancellation = ninfer::CancellationView([external = std::move(is_cancelled), sink]() {
-            return (external && external()) ||
-                   (sink != nullptr && sink->is_cancelled && sink->is_cancelled());
-        });
-    }
+    ninfer::CancellationView cancellation([&] {
+        return (output_sink != nullptr && output_sink->disconnected()) ||
+               (is_cancelled && is_cancelled()) ||
+               (sink != nullptr && sink->is_cancelled && sink->is_cancelled());
+    });
 
     ninfer::GenerationResult result;
     try {
@@ -452,15 +472,18 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     GenerationOutcome outcome;
     outcome.text                = std::move(result.content);
     outcome.reasoning           = std::move(result.reasoning);
+    outcome.generated_token_ids = std::move(result.generated_token_ids);
     outcome.prompt_tokens       = static_cast<int>(result.prompt.prompt_tokens);
-    outcome.completion_tokens   = static_cast<int>(result.generated_token_ids.size());
+    outcome.completion_tokens   = static_cast<int>(outcome.generated_token_ids.size());
     outcome.reasoning_tokens    = static_cast<int>(result.reasoning_tokens);
     outcome.thinking            = result.thinking;
+    outcome.constraint          = result.constraint;
     outcome.finish_reason       = result.finish_reason;
     outcome.matched_stop_string = std::move(result.matched_stop_string);
     outcome.id_slot             = result.slot;
     outcome.session_digest      = std::move(result.session_digest);
 
+    outcome.metrics.engine_request_id = result.engine_request_id;
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
     outcome.metrics.ttft_seconds =
         prepared.prepare_seconds +
@@ -474,6 +497,10 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         prepared.prepare_seconds +
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);
     outcome.metrics.engine_timing               = result.engine_timing;
+    outcome.metrics.first_output_timing         = result.first_output_timing;
+    outcome.metrics.scheduling                  = result.scheduling;
+    outcome.metrics.admission                   = result.admission;
+    outcome.metrics.computed_prefill_tokens     = result.computed_prefill_tokens;
     outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
     outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
     outcome.metrics.materialization             = result.materialization;

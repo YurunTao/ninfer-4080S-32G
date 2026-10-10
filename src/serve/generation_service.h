@@ -26,15 +26,20 @@ struct RequestLifetime;
 struct RequestCapacity;
 
 struct GenerationMetrics {
-    double prepare_seconds         = 0.0;
-    double ttft_seconds            = 0.0;
-    double vision_seconds          = 0.0;
-    double prefill_seconds         = 0.0;
-    double decode_seconds          = 0.0;
-    double prompt_wall_seconds     = 0.0;
-    double generation_wall_seconds = 0.0;
-    double total_seconds           = 0.0;
+    std::uint64_t engine_request_id       = 0;
+    std::uint32_t computed_prefill_tokens = 0;
+    double prepare_seconds                = 0.0;
+    double ttft_seconds                   = 0.0;
+    double vision_seconds                 = 0.0;
+    double prefill_seconds                = 0.0;
+    double decode_seconds                 = 0.0;
+    double prompt_wall_seconds            = 0.0;
+    double generation_wall_seconds        = 0.0;
+    double total_seconds                  = 0.0;
     ninfer::GenerationEngineTiming engine_timing;
+    std::optional<ninfer::GenerationFirstOutputTiming> first_output_timing;
+    ninfer::GenerationSchedulingStats scheduling;
+    ninfer::GenerationAdmissionStats admission;
 
     SpeculativeBackend speculative_backend    = SpeculativeBackend::None;
     std::uint32_t speculative_draft_window    = 0;
@@ -51,12 +56,14 @@ struct GenerationMetrics {
 struct GenerationOutcome {
     std::string text;
     std::string reasoning;
+    std::vector<ninfer::TokenId> generated_token_ids;
     std::vector<ninfer::GeneratedToolCall> tool_calls;
     ninfer::ToolCallParseDiagnostics tool_call_parse;
     int prompt_tokens     = 0;
     int completion_tokens = 0;
     int reasoning_tokens  = 0;
     ninfer::ThinkingBudgetStats thinking;
+    std::optional<ninfer::ConstraintObservation> constraint;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     std::optional<std::string> matched_stop_string;
     GenerationMetrics metrics;
@@ -64,6 +71,13 @@ struct GenerationOutcome {
     // not retain it) - the handle a client needs for /slots save operations.
     int id_slot = -1;
     std::string session_digest;
+};
+
+// A transport may report an interrupted stream through a callback or is_cancelled().
+// Generation still settles through Engine cancellation and returns its actual work statistics.
+class ClientDisconnected final : public std::exception {
+public:
+    [[nodiscard]] const char* what() const noexcept override { return "client disconnected"; }
 };
 
 struct StreamSink {
@@ -95,8 +109,8 @@ struct PreparedRequest {
     int prompt_tokens    = 0;
     bool enable_thinking = true;
     std::optional<std::uint32_t> thinking_budget;
-    std::optional<ninfer::ReasoningEffort> effective_reasoning_effort;
-    bool preserve_thinking = false;
+    std::optional<ninfer::ReasoningEffort> reasoning_effort;
+    std::optional<bool> preserve_thinking;
     std::shared_ptr<RequestLifetime> lifetime;
 };
 
