@@ -18,9 +18,11 @@ void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight
                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
                                         Tensor& z, cudaStream_t stream);
 
+// The grouped MMA route is the R64/C128 schedule for the multi-token band; the plan
+// selects it by schedule id and the kernel no longer takes the id itself.
 void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qkv, Tensor& z,
-                                        Q4Q5GdnInputScheduleId schedule, cudaStream_t stream);
+                                        cudaStream_t stream);
 
 void q4_q5_gdn_input_conv_snapshot_launch(const Tensor& x, const Weight& qk_weight,
                                           const Weight& value_z_weight, const Tensor& conv_weight,

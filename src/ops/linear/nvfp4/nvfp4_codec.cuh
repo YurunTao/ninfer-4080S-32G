@@ -24,9 +24,10 @@ __device__ __forceinline__ float decode_nvfp4_e4m3(std::uint8_t storage) {
 }
 
 __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, std::uint8_t scale) {
-#if __CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)
-    // PTX 9.2 exposes native pair widening. E2M1 times a finite E4M3 scale needs
-    // at most six significand bits, so the BF16 multiplication is exact.
+    // The native pair widening is PTX 9.2 on sm_90 and newer only; sm_89 keeps the
+    // exact FP32 expansion below. Host passes never define __CUDA_ARCH__.
+#if (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)) && \
+    defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     unsigned values, multiplier, result;
     asm("{\n"
         ".reg .b8 packed;\n"
@@ -40,7 +41,8 @@ __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, st
     asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(result) : "r"(values), "r"(multiplier));
     return result;
 #else
-    // CUDA 13.1 retains the exact FP32 expansion.
+    // Exact FP32 expansion: E2M1 times a finite E4M3 scale needs at most six
+    // significand bits, so the BF16 rounding reproduces the same pair.
     const float2 values    = decode_nvfp4_e2m1x2(code);
     const float multiplier = decode_nvfp4_e4m3(scale);
 
@@ -71,8 +73,27 @@ struct alignas(8) Nvfp4QuantizedK16 {
 
 static_assert(alignof(Nvfp4QuantizedK16) == 8);
 
+// E2M1 code points, smallest magnitude first. Bit 3 is the sign, so the code for a
+// negative value is the positive code with that bit set.
+__device__ __forceinline__ std::uint32_t nvfp4_e2m1_encode(float value) {
+    constexpr float kMagnitudes[8] = {0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F};
+    const float magnitude          = fabsf(value);
+    std::uint32_t code             = 7;
+#pragma unroll
+    for (std::uint32_t candidate = 0; candidate < 7; ++candidate) {
+        // Ties go to the smaller magnitude, which is the hardware's round-to-nearest-even
+        // behaviour on this code point table (every midpoint is exactly representable).
+        if (magnitude <= 0.5F * (kMagnitudes[candidate] + kMagnitudes[candidate + 1])) {
+            code = candidate;
+            break;
+        }
+    }
+    return code | (value < 0.0F ? 8U : 0U);
+}
+
 __device__ __forceinline__ void
 pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint32_t& codes_hi) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile("{\n"
                  ".reg .b8 b0;\n"
                  ".reg .b8 b1;\n"
@@ -98,6 +119,22 @@ pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint
                    "f"(values[2].x), "f"(values[2].y), "f"(values[3].x), "f"(values[3].y),
                    "f"(values[4].x), "f"(values[4].y), "f"(values[5].x), "f"(values[5].y),
                    "f"(values[6].x), "f"(values[6].y), "f"(values[7].x), "f"(values[7].y));
+#else
+    // cvt.rn.satfinite.e2m1x2.f32 needs sm_90 or newer; the code point table above
+    // rounds identically, so sm_89 and the host pass use it.
+    std::uint32_t low = 0, high = 0;
+#pragma unroll
+    for (std::uint32_t pair = 0; pair < 8; ++pair) {
+        const std::uint32_t nibbles =
+            nvfp4_e2m1_encode(values[pair].x) | (nvfp4_e2m1_encode(values[pair].y) << 4);
+        if (pair < 4)
+            low |= nibbles << (pair * 8);
+        else
+            high |= nibbles << ((pair - 4) * 8);
+    }
+    codes_lo = low;
+    codes_hi = high;
+#endif
 }
 
 __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloat16* source,

@@ -348,7 +348,9 @@ bool launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
         // twice per launch. Full and Predicated are separate instances with their own register
         // counts, so each launch is sized by the residency of the variant it runs.
         const auto resident_tiles = [&](auto full_tokens) -> std::int64_t {
-            constexpr bool FullTokens = decltype(full_tokens)::value;
+            // Static storage keeps the nested occupancy lambda from needing to capture it,
+            // which MSVC rejects for a constexpr local.
+            static constexpr bool FullTokens = decltype(full_tokens)::value;
             static const int resident_per_sm = [] {
                 auto kernel =
                     bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,

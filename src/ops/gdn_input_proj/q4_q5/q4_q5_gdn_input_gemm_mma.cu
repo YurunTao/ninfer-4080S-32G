@@ -82,24 +82,10 @@ void launch_grouped(const Tensor& x, const Weight& qk_weight, const Weight& valu
 
 void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qkv, Tensor& z,
-                                        Q4Q5GdnInputScheduleId schedule, cudaStream_t stream) {
-    switch (schedule) {
-    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C32S2:
-        launch_grouped<GemmCfg<32, 32, 64, 16, 16, 2, 1, false, true, true>>(
-            x, qk_weight, value_z_weight, qkv, z, stream);
-        return;
-    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C64S4:
-        launch_grouped<GemmCfg<32, 64, 64, 16, 16, 4, 1, false, true, true>>(
-            x, qk_weight, value_z_weight, qkv, z, stream);
-        return;
-    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128S2:
-        launch_grouped<GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>>(
-            x, qk_weight, value_z_weight, qkv, z, stream);
-        return;
-    case Q4Q5GdnInputScheduleId::IndependentDirectFixed:
-        break;
-    }
-    throw std::logic_error("Q4/Q5 GDN input: grouped MMA schedule is unknown");
+                                        cudaStream_t stream) {
+    launch_grouped<GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>>(x, qk_weight,
+                                                                        value_z_weight, qkv, z,
+                                                                        stream);
 }
 
 } // namespace ninfer::ops::detail

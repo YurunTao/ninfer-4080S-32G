@@ -7,6 +7,15 @@
 
 namespace ninfer::pdl {
 
+// Programmatic dependent launch (griddepcontrol, launch_dependents) needs sm_90 or
+// newer. This branch targets sm_89, where the same fall back as the sm_86 port
+// applies: plain launches in stream order, with no dependency intrinsics emitted.
+#if defined(NINFER_SM86) || defined(NINFER_ARCH_SM89)
+#define NINFER_PDL_UNAVAILABLE 1
+#else
+#define NINFER_PDL_UNAVAILABLE 0
+#endif
+
 struct LaunchConfig {
     dim3 grid;
     dim3 block;
@@ -20,7 +29,7 @@ struct LaunchConfig {
 template <class... KernelArgs, class... CallArgs>
 [[nodiscard]] inline cudaError_t
 launch_dependent(const LaunchConfig& launch, void (*kernel)(KernelArgs...), CallArgs&&... args) {
-#if defined(NINFER_SM86)
+#if NINFER_PDL_UNAVAILABLE
     kernel<<<launch.grid, launch.block, launch.dynamic_smem_bytes, launch.stream>>>(
         std::forward<CallArgs>(args)...);
     return cudaGetLastError();
@@ -44,14 +53,14 @@ launch_dependent(const LaunchConfig& launch, void (*kernel)(KernelArgs...), Call
 // Every producer CTA must call this at least once or exit. This enables dependent scheduling but
 // does not make producer writes visible to the consumer.
 __device__ __forceinline__ void trigger_dependents() {
-#if !defined(NINFER_SM86)
+#if !NINFER_PDL_UNAVAILABLE
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
 // Call on every consumer control path before its first access to producer-dependent data.
 __device__ __forceinline__ void wait_for_dependencies() {
-#if !defined(NINFER_SM86)
+#if !NINFER_PDL_UNAVAILABLE
     cudaGridDependencySynchronize();
 #endif
 }
