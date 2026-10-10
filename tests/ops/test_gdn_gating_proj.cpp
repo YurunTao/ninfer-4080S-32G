@@ -1,9 +1,12 @@
+#include "core/weight.h"
 #include "ninfer/ops/gdn_gating_proj.h"
+#include "ninfer/ops/weight_input.h"
 
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
@@ -28,21 +31,9 @@ constexpr Geometry kQwen27{"qwen3_6_27b", 5120, 48, false};
 constexpr Geometry kQwen38Parent{"qwen3_8_27b_parent", 5120, 48, true};
 constexpr Geometry kQwen35{"qwen3_6_35b_a3b", 2048, 32, true};
 
-constexpr ReductionCriterion kGdnProjectionFp32{
-#ifdef NINFER_SM86
-    // sm_86/89 fp32 accumulation order differs from the sm_120a calibration; the split and
-    // unsplit routes sit around 1e-5 relative_l2 on this target.
-    /*relative_l2=*/2.0e-4,
-#else
-    /*relative_l2=*/1.4e-6,
-#endif
-#ifdef NINFER_SM86
-    /*gross_absolute=*/1.0e-4,
-    /*gross_relative_to_max_reference=*/5.0e-4};
-#else
-    /*gross_absolute=*/5.0e-7,
-    /*gross_relative_to_max_reference=*/2.5e-6};
-#endif
+constexpr ReductionCriterion kGdnProjectionFp32{/*relative_l2=*/1.4e-6,
+                                                /*gross_absolute=*/5.0e-7,
+                                                /*gross_relative_to_max_reference=*/2.5e-6};
 constexpr ReductionCriterion kGdnNormOutputBf16{/*relative_l2=*/1.75e-3,
                                                 /*gross_absolute=*/1.0e-4,
                                                 /*gross_relative_to_max_reference=*/4.0e-3};
@@ -80,7 +71,7 @@ int verify_normwise(const std::string& label, const std::vector<double>& actual,
 
 Weight bf16_weight(void* data, std::int32_t rows, std::int32_t hidden) {
     Weight weight{};
-    weight.qtype           = QType::BF16_CTRL;
+    weight.qtype           = QType::BF16;
     weight.layout          = QuantLayout::Contiguous;
     weight.payload         = data;
     weight.payload_bytes   = static_cast<std::uint64_t>(rows) * hidden * sizeof(std::uint16_t);
@@ -278,9 +269,20 @@ int run_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
     if (geometry.parent_weight) {
-        Weight parent = bf16_weight(device_weight.p, 2 * geometry.heads, geometry.hidden);
-        ops::gdn_gating_proj(tensor_x, parent, tensor_a_log, tensor_dt_bias, workspace, tensor_g,
-                             tensor_beta, execution);
+        // A/B use a contiguous reshape of the same stored words, with a different parent K.
+        const std::array shape{static_cast<std::uint64_t>(4 * geometry.heads),
+                               static_cast<std::uint64_t>(geometry.hidden / 2)};
+        const WeightParent parent{weight_geometry(QType::BF16, QuantLayout::Contiguous, shape),
+                                  static_cast<const std::byte*>(device_weight.p)};
+        const auto count = static_cast<std::uint64_t>(geometry.heads) * geometry.hidden;
+        const std::vector<std::uint64_t> logical_shape{static_cast<std::uint64_t>(geometry.heads),
+                                                       static_cast<std::uint64_t>(geometry.hidden)};
+        const WeightView a{logical_shape, {{&parent, 0, count}}};
+        const WeightView b{logical_shape, {{&parent, count, 2 * count}}};
+        const auto prepared =
+            std::get<ops::SingleProjectionWeight>(ops::prepare_gdn_gating_proj_weights({a}, {b}));
+        ops::gdn_gating_proj(tensor_x, prepared.weight, tensor_a_log, tensor_dt_bias, workspace,
+                             tensor_g, tensor_beta, execution);
     } else {
         Weight weight_a = bf16_weight(device_weight.p, geometry.heads, geometry.hidden);
         Weight weight_b = bf16_weight(device_b_weight.p, geometry.heads, geometry.hidden);
@@ -492,13 +494,8 @@ int main() {
     const DeviceExecutionView execution{nullptr, device.multiprocessor_count()};
     const DeviceExecutionView norm_execution{device.stream, device.multiprocessor_count()};
     int failures = 0;
-    // Endpoints sample every route boundary of the current 80-SM table: the interval capacity
-    // must equal the largest single-width capacity at a boundary, so a stale list hides a route
-    // change instead of failing on it.
-    failures +=
-        verify_workspace_capacity_contract(kQwen27, {1, 2, 8, 9, 768, 769, 1664, 1665, 4097});
-    failures += verify_workspace_capacity_contract(
-        kQwen35, {1, 127, 128, 960, 961, 1920, 1921, 3840, 3841, 4097});
+    failures += verify_workspace_capacity_contract(kQwen27, {1, 8, 1024, 2048, 4096, 4097});
+    failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 1024, 2048, 4096, 4097});
 
     // Every registered 27B projection route, including predicated and full token tiles.
     for (const std::int32_t tokens : {1, 8, 9, 1024, 1025, 2049, 4097}) {

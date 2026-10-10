@@ -8,6 +8,7 @@
 //   ncu --profile-from-start off ./build/bench/ninfer_linear_bench \
 //       --qtype q4 --n 4096 --k 5120 --t 8 --profile
 
+#include "core/weight.h"
 #include "ninfer/ops/linear.h"
 
 #include "core/device.h"
@@ -43,12 +44,14 @@ constexpr double kRtx5090DramGBs          = 1792.0;
 constexpr double kRtx5090SustainedReadGBs = 1674.5;
 // NVIDIA's GB202 table reports dense/sparse pairs at boost clock. Keep input and accumulator
 // precision explicit for the qualified Tensor Core routes below.
-constexpr double kRtx5090Fp8Fp16AccumulateTFLOPs  = 838.0;
-constexpr double kRtx5090Fp8Fp32AccumulateTFLOPs  = 419.0;
-constexpr double kRtx5090Bf16Fp32AccumulateTFLOPs = 209.5;
-constexpr std::uint64_t kDefaultFlushBytes        = 256ULL << 20;
-constexpr int kDefaultWarmup                      = 3;
-constexpr int kDefaultRepeat                      = 20;
+constexpr double kRtx5090Fp8Fp16AccumulateTFLOPs = 838.0;
+constexpr double kRtx5090Fp8Fp32AccumulateTFLOPs = 419.0;
+// Unit-scale block-scaled FP8 uses the full-rate FP32 accumulation path on RTX 5090.
+constexpr double kRtx5090MxFp8Fp32AccumulateTFLOPs = 838.0;
+constexpr double kRtx5090Bf16Fp32AccumulateTFLOPs  = 209.5;
+constexpr std::uint64_t kDefaultFlushBytes         = 256ULL << 20;
+constexpr int kDefaultWarmup                       = 3;
+constexpr int kDefaultRepeat                       = 20;
 
 enum class TClass : std::uint8_t {
     Continuous,
@@ -64,34 +67,34 @@ struct SuiteEntry {
 };
 
 constexpr SuiteEntry kQwen27bEntries[] = {
-    {"27b.output_head", QType::Q6G64_F16S, 248320, 5120, TClass::Continuous},
-    {"27b.draft_head", QType::Q4G64_F16S, 131072, 5120, TClass::Continuous},
-    {"27b.gdn_output_gate", QType::Q5G64_F16S, 6144, 5120, TClass::Continuous},
-    {"27b.mtp_input", QType::W8G32_F16S, 5120, 10240, TClass::Continuous},
-    {"27b.mtp_attention", QType::W8G32_F16S, 14336, 5120, TClass::Continuous},
-    {"27b.mtp_gate_up", QType::W8G32_F16S, 34816, 5120, TClass::Continuous},
-    {"27b.mtp_down", QType::W8G32_F16S, 5120, 17408, TClass::Continuous},
-    {"27b.vision_patch", QType::Q6G64_F16S, 1152, 1536, TClass::VisionStep4},
-    {"27b.vision_qkv", QType::Q4G64_F16S, 3456, 1152, TClass::VisionStep4},
-    {"27b.vision_attn_out", QType::Q5G64_F16S, 1152, 1152, TClass::VisionStep4},
-    {"27b.vision_fc1", QType::Q4G64_F16S, 4304, 1152, TClass::VisionStep4},
-    {"27b.vision_fc2", QType::Q5G64_F16S, 1152, 4304, TClass::VisionStep4},
-    {"27b.vision_merger_fc1", QType::W8G32_F16S, 4608, 4608, TClass::VisionStep4},
-    {"27b.vision_merger_fc2", QType::W8G32_F16S, 5120, 4608, TClass::VisionStep4},
+    {"27b.output_head", QType::Q6_G64_FP16, 248320, 5120, TClass::Continuous},
+    {"27b.draft_head", QType::Q4_G64_FP16, 131072, 5120, TClass::Continuous},
+    {"27b.gdn_output_gate", QType::Q5_G64_FP16, 6144, 5120, TClass::Continuous},
+    {"27b.mtp_input", QType::Q8_G32_FP16, 5120, 10240, TClass::Continuous},
+    {"27b.mtp_attention", QType::Q8_G32_FP16, 14336, 5120, TClass::Continuous},
+    {"27b.mtp_gate_up", QType::Q8_G32_FP16, 34816, 5120, TClass::Continuous},
+    {"27b.mtp_down", QType::Q8_G32_FP16, 5120, 17408, TClass::Continuous},
+    {"27b.vision_patch", QType::Q6_G64_FP16, 1152, 1536, TClass::VisionStep4},
+    {"27b.vision_qkv", QType::Q4_G64_FP16, 3456, 1152, TClass::VisionStep4},
+    {"27b.vision_attn_out", QType::Q5_G64_FP16, 1152, 1152, TClass::VisionStep4},
+    {"27b.vision_fc1", QType::Q4_G64_FP16, 4304, 1152, TClass::VisionStep4},
+    {"27b.vision_fc2", QType::Q5_G64_FP16, 1152, 4304, TClass::VisionStep4},
+    {"27b.vision_merger_fc1", QType::Q8_G32_FP16, 4608, 4608, TClass::VisionStep4},
+    {"27b.vision_merger_fc2", QType::Q8_G32_FP16, 5120, 4608, TClass::VisionStep4},
 };
 
 constexpr SuiteEntry kQwen35bEntries[] = {
-    {"35b.output_head", QType::Q6G64_F16S, 248320, 2048, TClass::Continuous},
-    {"35b.draft_head", QType::Q4G64_F16S, 131072, 2048, TClass::Continuous},
-    {"35b.mtp_projection", QType::W8G32_F16S, 2048, 4096, TClass::Continuous},
-    {"35b.dflash_feature", QType::W8G32_F16S, 2048, 16384, TClass::Continuous},
-    {"35b.vision_patch", QType::Q6G64_F16S, 1152, 1536, TClass::VisionStep4},
-    {"35b.vision_qkv", QType::Q4G64_F16S, 3456, 1152, TClass::VisionStep4},
-    {"35b.vision_attn_out", QType::Q5G64_F16S, 1152, 1152, TClass::VisionStep4},
-    {"35b.vision_fc1", QType::Q4G64_F16S, 4304, 1152, TClass::VisionStep4},
-    {"35b.vision_fc2", QType::Q5G64_F16S, 1152, 4304, TClass::VisionStep4},
-    {"35b.vision_merger_fc1", QType::W8G32_F16S, 4608, 4608, TClass::VisionStep4},
-    {"35b.vision_merger_fc2", QType::W8G32_F16S, 2048, 4608, TClass::VisionStep4},
+    {"35b.output_head", QType::Q6_G64_FP16, 248320, 2048, TClass::Continuous},
+    {"35b.draft_head", QType::Q4_G64_FP16, 131072, 2048, TClass::Continuous},
+    {"35b.mtp_projection", QType::Q8_G32_FP16, 2048, 4096, TClass::Continuous},
+    {"35b.dflash_feature", QType::Q8_G32_FP16, 2048, 16384, TClass::Continuous},
+    {"35b.vision_patch", QType::Q6_G64_FP16, 1152, 1536, TClass::VisionStep4},
+    {"35b.vision_qkv", QType::Q4_G64_FP16, 3456, 1152, TClass::VisionStep4},
+    {"35b.vision_attn_out", QType::Q5_G64_FP16, 1152, 1152, TClass::VisionStep4},
+    {"35b.vision_fc1", QType::Q4_G64_FP16, 4304, 1152, TClass::VisionStep4},
+    {"35b.vision_fc2", QType::Q5_G64_FP16, 1152, 4304, TClass::VisionStep4},
+    {"35b.vision_merger_fc1", QType::Q8_G32_FP16, 4608, 4608, TClass::VisionStep4},
+    {"35b.vision_merger_fc2", QType::Q8_G32_FP16, 2048, 4608, TClass::VisionStep4},
 };
 
 struct Sweep {
@@ -110,7 +113,7 @@ struct Options {
     bool profile        = false;
     bool graph          = false;
     int graph_calls     = 1;
-    QType qtype         = QType::Q4G64_F16S;
+    QType qtype         = QType::Q4_G64_FP16;
     LinearPolicy policy = LinearPolicy::A16Only;
     std::int32_t n      = 0;
     std::int32_t k      = 0;
@@ -183,15 +186,6 @@ struct LinearBenchWeight {
     [[nodiscard]] std::uint64_t model_weight_bytes() const noexcept { return model_bytes; }
 };
 
-__global__ void fill_bf16_kernel(__nv_bfloat16* values, std::uint64_t count) {
-    const std::uint64_t begin  = blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x;
-    const std::uint64_t stride = gridDim.x * static_cast<std::uint64_t>(blockDim.x);
-    for (std::uint64_t i = begin; i < count; i += stride) {
-        const float value = 0.5F - static_cast<float>(i % 251ULL) / 250.0F;
-        values[i]         = __float2bfloat16(value);
-    }
-}
-
 std::uint64_t checked_add(std::uint64_t a, std::uint64_t b, const char* label) {
     if (a > std::numeric_limits<std::uint64_t>::max() - b) {
         throw std::overflow_error(std::string(label) + " overflows uint64");
@@ -212,12 +206,6 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
                        "aligned size");
 }
 
-int launch_grid(std::uint64_t elements) {
-    constexpr int block        = 256;
-    const std::uint64_t blocks = (elements + block - 1) / block;
-    return static_cast<int>(std::max<std::uint64_t>(1, std::min<std::uint64_t>(blocks, 65535)));
-}
-
 std::string lower(std::string_view text) {
     std::string out(text);
     for (char& c : out) {
@@ -228,19 +216,19 @@ std::string lower(std::string_view text) {
 
 const char* qtype_name(QType qtype) {
     switch (qtype) {
-    case QType::Q4G64_F16S:
+    case QType::Q4_G64_FP16:
         return "Q4";
-    case QType::Q5G64_F16S:
+    case QType::Q5_G64_FP16:
         return "Q5";
-    case QType::Q6G64_F16S:
+    case QType::Q6_G64_FP16:
         return "Q6";
-    case QType::W8G32_F16S:
-        return "W8";
-    case QType::BF16_CTRL:
+    case QType::Q8_G32_FP16:
+        return "Q8";
+    case QType::BF16:
         return "BF16";
     case QType::NVFP4:
         return "NVFP4";
-    case QType::FP8_E4M3FN_ROW_BF16S:
+    case QType::FP8_E4M3FN_ROW_BF16:
         return "FP8";
     default:
         break;
@@ -257,13 +245,13 @@ const char* policy_name(LinearPolicy policy) {
 
 QType parse_qtype(std::string_view text) {
     const std::string value = lower(text);
-    if (value == "q4" || value == "q4g64_f16s") { return QType::Q4G64_F16S; }
-    if (value == "q5" || value == "q5g64_f16s") { return QType::Q5G64_F16S; }
-    if (value == "q6" || value == "q6g64_f16s") { return QType::Q6G64_F16S; }
-    if (value == "w8" || value == "w8g32" || value == "w8g32_f16s") { return QType::W8G32_F16S; }
-    if (value == "bf16" || value == "bf16_ctrl") { return QType::BF16_CTRL; }
+    if (value == "q4" || value == "q4_g64_fp16") { return QType::Q4_G64_FP16; }
+    if (value == "q5" || value == "q5_g64_fp16") { return QType::Q5_G64_FP16; }
+    if (value == "q6" || value == "q6_g64_fp16") { return QType::Q6_G64_FP16; }
+    if (value == "q8" || value == "q8_g32_fp16") { return QType::Q8_G32_FP16; }
+    if (value == "bf16") { return QType::BF16; }
     if (value == "nvfp4") { return QType::NVFP4; }
-    if (value == "fp8" || value == "fp8_e4m3fn_row_bf16s") { return QType::FP8_E4M3FN_ROW_BF16S; }
+    if (value == "fp8" || value == "fp8_e4m3fn_row_bf16") { return QType::FP8_E4M3FN_ROW_BF16; }
     throw std::invalid_argument("unknown qtype: " + std::string(text));
 }
 
@@ -330,8 +318,8 @@ Sweep parse_sweep(std::string_view text) {
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "Usage:\n"
-                 "  %s --qtype Q4|Q5|Q6|W8|BF16|NVFP4|FP8 --n N --k K --t T [options]\n"
-                 "  %s --qtype Q4|Q5|Q6|W8|BF16|NVFP4|FP8 --n N --k K --sweep START:END[:STEP] "
+                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8 --n N --k K --t T [options]\n"
+                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8 --n N --k K --sweep START:END[:STEP] "
                  "[options]\n"
                  "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|all [options]\n\n"
                  "Options:\n"
@@ -516,7 +504,7 @@ std::vector<PointGroup> group_points(const std::vector<BenchPoint>& points) {
 }
 
 LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
-    if (qtype == QType::BF16_CTRL) {
+    if (qtype == QType::BF16) {
         bench::DirectBf16Weight direct  = bench::make_direct_bf16_weight(n, k);
         const std::uint64_t model_bytes = direct.model_weight_bytes();
         return {std::move(direct.storage), direct.weight, model_bytes};
@@ -526,7 +514,7 @@ LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
         const std::uint64_t model_bytes     = packed.model_weight_bytes();
         return {std::move(packed.storage), packed.weight, model_bytes};
     }
-    if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+    if (qtype == QType::FP8_E4M3FN_ROW_BF16) {
         bench::PackedQuantizedWeight packed = bench::make_fp8_weight(n, k);
         const std::uint64_t model_bytes     = packed.model_weight_bytes();
         return {std::move(packed.storage), packed.weight, model_bytes};
@@ -536,16 +524,14 @@ LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
         throw std::overflow_error("padded K does not fit int32");
     }
     bench::PackedQuantizedWeight packed =
-        bench::make_row_split_weight(qtype, n, k, static_cast<std::int32_t>(padded_k_u64),
-                                     bench::QuantizedWeightFill{0x31, 0xa5, 0x3c00});
+        bench::make_row_split_weight(qtype, n, k, static_cast<std::int32_t>(padded_k_u64), 501U);
     const std::uint64_t model_bytes = packed.model_weight_bytes();
     return {std::move(packed.storage), packed.weight, model_bytes};
 }
 
 void fill_activation(DeviceBuffer& buffer, std::uint64_t elements, cudaStream_t stream) {
-    fill_bf16_kernel<<<launch_grid(elements), 256, 0, stream>>>(
-        static_cast<__nv_bfloat16*>(buffer.p), elements);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(bench::fixture::fill_values(static_cast<__nv_bfloat16*>(buffer.p), elements, 101U,
+                                           -0.5F, 0.5F, stream));
 }
 
 std::string join_labels(const std::vector<std::string>& labels) {
@@ -560,22 +546,54 @@ std::string join_labels(const std::vector<std::string>& labels) {
 double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profile) {
     // Report Tensor Core utilization only when the exact registered problem and extent determine
     // that the public route executes the named MMA profile.
+    if (point.qtype == QType::Q8_G32_FP16 &&
+        ((point.n == 2560 && point.k == 6144) || (point.n == 6144 && point.k == 2560) ||
+         (point.n == 10240 && point.k == 2560) || (point.n == 12288 && point.k == 2560) ||
+         (point.n == 16384 && point.k == 2560)) &&
+        point.t > 1) {
+        profile = "BF16_F32ACC";
+        return kRtx5090Bf16Fp32AccumulateTFLOPs;
+    }
+    if (point.qtype == QType::FP8_E4M3FN_ROW_BF16 &&
+        (((point.n == 14336 || point.n == 16384) && point.k == 5120) ||
+         (point.n == 5120 && (point.k == 6144 || point.k == 17408))) &&
+        point.t > 1 && (point.policy == LinearPolicy::A16Only || point.t <= 16)) {
+        profile = "BF16_F32ACC";
+        return kRtx5090Bf16Fp32AccumulateTFLOPs;
+    }
     const bool fp8_problem =
         (point.n == 14336 && point.k == 5120) || (point.n == 16384 && point.k == 5120) ||
         (point.n == 34816 && point.k == 5120) || (point.n == 5120 && point.k == 6144) ||
         (point.n == 5120 && point.k == 17408);
     const bool fp8_tensor_route =
-        (point.n == 14336 && point.k == 5120 && point.t >= 12) ||
-        (point.n == 16384 && point.k == 5120 && point.t >= 11) ||
-        (point.n == 34816 && point.k == 5120 && (point.t == 1 || point.t >= 5)) ||
-        (point.n == 5120 && (point.k == 6144 || point.k == 17408) && point.t >= 25);
-    if (point.qtype == QType::FP8_E4M3FN_ROW_BF16S && point.policy == LinearPolicy::AllowA8 &&
+        (point.n == 14336 && point.k == 5120 && point.t >= 17) ||
+        (point.n == 16384 && point.k == 5120 && point.t >= 17) ||
+        (point.n == 34816 && point.k == 5120 && point.t >= 5) ||
+        (point.n == 5120 && (point.k == 6144 || point.k == 17408) && point.t >= 17);
+    if (point.qtype == QType::FP8_E4M3FN_ROW_BF16 && point.policy == LinearPolicy::AllowA8 &&
         fp8_problem && fp8_tensor_route) {
-        profile = "FP8_F32ACC";
-        return kRtx5090Fp8Fp32AccumulateTFLOPs;
+        profile = "MXFP8_F32ACC";
+        return kRtx5090MxFp8Fp32AccumulateTFLOPs;
     }
-    if (point.qtype == QType::BF16_CTRL && point.policy == LinearPolicy::A16Only &&
-        point.n == 256 && point.k == 5120) {
+    if (point.qtype == QType::BF16 &&
+        ((point.n == 256 && point.k == 5120) ||
+         ((point.n == 48 || point.n == 96) && point.k == 2560 && point.t >= 17) ||
+         (point.n == 1664 && point.k == 2560 && point.t >= 2) ||
+         (point.n == 2560 && point.k == 4608 && point.t >= 3) ||
+         (point.n == 4608 && point.k == 4608 && point.t >= 3) ||
+         (point.n == 4304 && point.k == 1152 && point.t >= 4) ||
+         (point.n == 1152 && point.k == 4304 && point.t >= 4) ||
+         (point.n == 1152 && point.k == 1152 && point.t >= 8) ||
+         (point.n == 1152 && point.k == 1536 && point.t >= 4) ||
+         (point.n == 3456 && point.k == 1152 && point.t >= 4) ||
+         (point.n == 2560 && point.k == 2560 && point.t >= 2) ||
+         (point.n == 2560 && point.k == 6144 && point.t >= 2) ||
+         (point.n == 13952 && point.k == 2560 && point.t >= 2) ||
+         (point.n == 248320 && point.k == 2560 && point.t >= 2) ||
+         (point.n == 12800 && point.k == 2560 && point.t >= 2) ||
+         (point.n == 10240 && point.k == 320 && point.t >= 2) ||
+         (point.n == 320 && point.k == 10240 && point.t >= 9) ||
+         (point.n == 324 && point.k == 10240 && point.t >= 9))) {
         profile = "BF16_F32ACC";
         return kRtx5090Bf16Fp32AccumulateTFLOPs;
     }
@@ -634,8 +652,8 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     return result;
 }
 
-std::vector<Result> run_group(const PointGroup& group, const Options& opt, DeviceBuffer& flush,
-                              cudaStream_t stream) {
+std::vector<Result> run_group(const PointGroup& group, const Options& opt,
+                              bench::L2FlushBuffer& flush, cudaStream_t stream) {
     const std::int32_t max_t =
         std::max_element(group.points.begin(), group.points.end(),
                          [](const BenchPoint& a, const BenchPoint& b) { return a.t < b.t; })
@@ -699,7 +717,7 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
     return results;
 }
 
-void run_profile(const BenchPoint& point, const Options& opt, DeviceBuffer& flush,
+void run_profile(const BenchPoint& point, const Options& opt, bench::L2FlushBuffer& flush,
                  cudaStream_t stream) {
     const std::uint64_t x_elements =
         checked_mul(static_cast<std::uint64_t>(point.k), point.t, "activation allocation");
@@ -767,8 +785,9 @@ void print_header(const Options& opt) {
     std::printf("# dram_spec_gbs=%.1f sustained_read_gbs=%.1f cache=%s\n", kRtx5090DramGBs,
                 kRtx5090SustainedReadGBs,
                 opt.graph_calls == 1 ? "cold" : "cold-before-graph-bundle");
-    std::printf("# dense_fp8_tensor_tflops fp16_acc=%.1f fp32_acc=%.1f\n",
-                kRtx5090Fp8Fp16AccumulateTFLOPs, kRtx5090Fp8Fp32AccumulateTFLOPs);
+    std::printf("# dense_fp8_tensor_tflops fp16_acc=%.1f fp32_acc=%.1f mxfp8_fp32_acc=%.1f\n",
+                kRtx5090Fp8Fp16AccumulateTFLOPs, kRtx5090Fp8Fp32AccumulateTFLOPs,
+                kRtx5090MxFp8Fp32AccumulateTFLOPs);
     std::printf("# dense_bf16_tensor_tflops fp32_acc=%.1f\n", kRtx5090Bf16Fp32AccumulateTFLOPs);
 }
 
@@ -867,7 +886,7 @@ int main(int argc, char** argv) {
 
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        DeviceBuffer flush(opt.flush_bytes);
+        bench::L2FlushBuffer flush(opt.flush_bytes);
         const std::vector<BenchPoint> points = expand_points(opt);
 
         print_header(opt);

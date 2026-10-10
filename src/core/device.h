@@ -16,6 +16,11 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 struct DeviceExecutionView {
     cudaStream_t stream               = nullptr;
     std::int32_t multiprocessor_count = 0;
+
+    [[nodiscard]] constexpr DeviceExecutionView
+    on_stream(cudaStream_t target_stream) const noexcept {
+        return {target_stream, multiprocessor_count};
+    }
 };
 
 struct DeviceContext {
@@ -36,9 +41,9 @@ struct DeviceContext {
     void bind_to_current_thread_noexcept() const noexcept;
     int compute_capability() const noexcept;
     int multiprocessor_count() const noexcept;
-    int sm() const noexcept;
     DeviceExecutionView execution_view() const noexcept;
     std::size_t total_vram() const noexcept;
+    const char* sync_mode() const;
     void synchronize() const;
 };
 
@@ -77,6 +82,9 @@ public:
     CudaCompletionEvent& operator=(CudaCompletionEvent&& other) noexcept;
 
     void record(cudaStream_t stream);
+    // Capture a record node observable by the host while later graph nodes are still running.
+    // Only call during stream capture; this event must outlive every graph referencing it.
+    void record_external(cudaStream_t stream);
     void wait(cudaStream_t stream) const;
     [[nodiscard]] bool ready() const;
     void synchronize() const;

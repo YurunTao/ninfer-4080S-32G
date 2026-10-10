@@ -1,9 +1,11 @@
+#include "core/weight.h"
 #include "ops/linear/linear_test_common.h"
 
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "ops/op_tester.h"
+#include "ops/direct_bf16_weight.h"
 
 #include <cuda_runtime.h>
 
@@ -206,30 +208,30 @@ int compare_output(std::string_view label, std::span<const double> actual,
 
 } // namespace
 
-quantized_weight::PackedWeight make_q4g64_f16s_weight(std::int32_t n, std::int32_t k,
-                                                      std::uint32_t seed) {
-    return quantized_weight::make_patterned_weight(QType::Q4G64_F16S, n, k, seed,
+quantized_weight::PackedWeight make_q4_g64_fp16_weight(std::int32_t n, std::int32_t k,
+                                                       std::uint32_t seed) {
+    return quantized_weight::make_patterned_weight(QType::Q4_G64_FP16, n, k, seed,
                                                    {quantized_weight::RowSplitScalePattern::Small,
                                                     quantized_weight::RowSplitCodePattern::Hashed});
 }
 
-quantized_weight::PackedWeight make_q5g64_f16s_weight(std::int32_t n, std::int32_t k,
-                                                      std::uint32_t seed) {
-    return quantized_weight::make_patterned_weight(QType::Q5G64_F16S, n, k, seed,
+quantized_weight::PackedWeight make_q5_g64_fp16_weight(std::int32_t n, std::int32_t k,
+                                                       std::uint32_t seed) {
+    return quantized_weight::make_patterned_weight(QType::Q5_G64_FP16, n, k, seed,
                                                    {quantized_weight::RowSplitScalePattern::Small,
                                                     quantized_weight::RowSplitCodePattern::Hashed});
 }
 
-quantized_weight::PackedWeight make_q6g64_f16s_weight(std::int32_t n, std::int32_t k,
-                                                      std::uint32_t seed) {
-    return quantized_weight::make_patterned_weight(QType::Q6G64_F16S, n, k, seed,
+quantized_weight::PackedWeight make_q6_g64_fp16_weight(std::int32_t n, std::int32_t k,
+                                                       std::uint32_t seed) {
+    return quantized_weight::make_patterned_weight(QType::Q6_G64_FP16, n, k, seed,
                                                    {quantized_weight::RowSplitScalePattern::Small,
                                                     quantized_weight::RowSplitCodePattern::Hashed});
 }
 
-quantized_weight::PackedWeight make_w8g32_f16s_weight(std::int32_t n, std::int32_t k,
-                                                      std::uint32_t seed) {
-    return quantized_weight::make_patterned_weight(QType::W8G32_F16S, n, k, seed,
+quantized_weight::PackedWeight make_q8_g32_fp16_weight(std::int32_t n, std::int32_t k,
+                                                       std::uint32_t seed) {
+    return quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, n, k, seed,
                                                    {quantized_weight::RowSplitScalePattern::Small,
                                                     quantized_weight::RowSplitCodePattern::Hashed});
 }
@@ -243,7 +245,18 @@ quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
 }
 
 quantized_weight::PackedWeight make_fp8_weight(std::int32_t n, std::int32_t k, std::uint32_t seed) {
-    return quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, n, k, seed);
+    return quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, n, k, seed);
+}
+
+quantized_weight::PackedWeight make_bf16_weight(std::int32_t n, std::int32_t k,
+                                                std::uint32_t seed) {
+    const auto host = direct_bf16_weight::make_patterned(n, k, seed);
+    quantized_weight::PackedWeight result;
+    result.payload.resize(host.bits.size() * sizeof(std::uint16_t));
+    std::memcpy(result.payload.data(), host.bits.data(), result.payload.size());
+    result.weight           = host.device_weight(result.payload.data());
+    result.code_plane_bytes = result.payload.size();
+    return result;
 }
 
 void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* output,
@@ -308,8 +321,23 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
     quantized_weight::PackedWeight host_weight = generator(shape.n, shape.k, shape.seed);
     const std::vector<float> oracle_weight =
         quantized_weight::materialize_rows_fp32(host_weight, oracle_rows);
-    const std::vector<std::uint16_t> activation_bits =
+    std::vector<std::uint16_t> activation_bits =
         make_activation(shape.k, maximum->t, shape.seed + 1U, activation_compute);
+    if (shape.activation_pattern != ActivationPattern::Dense) {
+        for (int token = 0; token < maximum->t; ++token) {
+            for (int column = 0; column < shape.k; ++column) {
+                float value = 0.0F;
+                if (shape.activation_pattern == ActivationPattern::Cancellation) {
+                    value = (column & 1) ? -0.25F : 0.25F;
+                    if (column == shape.k - 1) value = 0.125F;
+                } else if (column >= shape.k - 16) {
+                    value = static_cast<float>((column + token) % 3 - 1) * 0.25F;
+                }
+                activation_bits[static_cast<std::size_t>(token) * shape.k + column] =
+                    test::f32_to_bf16(value);
+            }
+        }
+    }
 
     DeviceBuffer device_activation(activation_bits.size() * sizeof(std::uint16_t));
     device_activation.copy_from_host(activation_bits.data(), device_activation.bytes);
@@ -441,6 +469,28 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
         if (weight_after != host_weight.payload) {
             std::cerr << label << ": linear modified its persistent weight\n";
             ++failures;
+        }
+    }
+    return failures;
+}
+
+int verify_workspace_envelopes(QType qtype, std::int32_t n, std::int32_t k) {
+    int failures = 0;
+    for (auto policy :
+         {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8, ops::LinearPolicy::AllowA4}) {
+        for (auto [first, last] : {std::pair{1, 4}, std::pair{2, 4}, std::pair{1, 128},
+                                   std::pair{9, 25}, std::pair{24, 129}}) {
+            const auto capacity =
+                ops::linear_workspace_capacity_bytes(qtype, n, k, policy, first, last);
+            for (int t = first; t <= last; ++t) {
+                const auto point = ops::linear_workspace_capacity_bytes(qtype, n, k, policy, t, t);
+                if (point > capacity) {
+                    std::cerr << "Linear workspace interval [" << first << ',' << last
+                              << "] cannot cover T=" << t << " for [" << n << ',' << k << "]\n";
+                    ++failures;
+                    break;
+                }
+            }
         }
     }
     return failures;

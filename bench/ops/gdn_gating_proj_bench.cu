@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer_bench_common.h"
 
@@ -128,7 +129,7 @@ DeviceBuffer fp32_values(std::size_t count, std::uint32_t seed, float low, float
 
 Weight weight(const void* data, int rows, int hidden) {
     Weight w{};
-    w.qtype   = QType::BF16_CTRL;
+    w.qtype   = QType::BF16;
     w.layout  = QuantLayout::Contiguous;
     w.payload = w.qdata = data;
     w.payload_bytes     = std::uint64_t(rows) * hidden * 2;
@@ -138,7 +139,7 @@ Weight weight(const void* data, int rows, int hidden) {
     return w;
 }
 
-void run(const Options& o, int t, DeviceExecutionView execution, DeviceBuffer& flush,
+void run(const Options& o, int t, DeviceExecutionView execution, bench::L2FlushBuffer& flush,
          std::ostream* csv) {
     const int heads = o.geometry35 ? 32 : 48, hidden = o.geometry35 ? 2048 : 5120;
     auto x    = bf16_values(std::size_t(hidden) * t, 13u, 1.0f);
@@ -248,7 +249,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaGetDeviceProperties(&props, device));
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        DeviceBuffer flush(256ULL << 20);
+        bench::L2FlushBuffer flush(256ULL << 20);
         std::ofstream csv;
         if (!o.csv.empty()) {
             csv.open(o.csv);

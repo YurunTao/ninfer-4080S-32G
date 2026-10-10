@@ -19,7 +19,8 @@ class CorpusError(RuntimeError):
     pass
 
 
-def entitlement(prompt_tokens: int, max_output_tokens: int) -> int:
+def full_length_kv_tokens(prompt_tokens: int, max_output_tokens: int) -> int:
+    """Page-rounded KV footprint if one independent request reaches its output limit."""
     if prompt_tokens < 0 or max_output_tokens <= 0:
         raise ValueError("prompt tokens must be nonnegative and max output must be positive")
     growth = max(max_output_tokens - 1, 0)
@@ -85,20 +86,23 @@ class Corpus:
             "long-8k-independent-32": (7680, 32, 7744),
             "long-64k-32": (64512, 32, 64576),
             "long-64k-independent-32": (64512, 32, 64576),
+            **{
+                f"rotation-55k-{index}": (55000, 32, 55040)
+                for index in range(6)
+            },
             "long-256k-32": (260096, 32, 260160),
             "interferer-256": (127, 256, 384),
             "holder-4096": (127, 4096, 4224),
-            "medium-3000": (30, 3000, 3072),
             "context-exact": (8129, 64, 8192),
         }
-        for name, (prompt, output, expected_entitlement) in expected.items():
+        for name, (prompt, output, expected_kv_tokens) in expected.items():
             record = shapes.get(name)
             if not isinstance(record, dict):
                 raise CorpusError(f"missing required shape: {name}")
             if record.get("prompt_tokens") != prompt or record.get("max_output_tokens") != output:
                 raise CorpusError(f"shape facts changed for {name}")
-            if entitlement(prompt, output) != expected_entitlement:
-                raise CorpusError(f"shape entitlement changed for {name}")
+            if full_length_kv_tokens(prompt, output) != expected_kv_tokens:
+                raise CorpusError(f"full-length KV footprint changed for {name}")
 
         independent_shapes = (
             ("long-8k-16", "long-8k-independent-32", "mixed-four"),
@@ -119,16 +123,69 @@ class Corpus:
                 )
 
         if not (
-            entitlement(7680, 16) + entitlement(127, 256) <= 8192
-            and entitlement(7680, 16) + 2 * entitlement(127, 256) > 8192
+            full_length_kv_tokens(7680, 16) + full_length_kv_tokens(127, 256) <= 8192
+            and full_length_kv_tokens(7680, 16) + 2 * full_length_kv_tokens(127, 256) > 8192
         ):
-            raise CorpusError("cache-pressure entitlement relation no longer holds")
-        long_64k_entitlement = entitlement(64512, 32)
+            raise CorpusError("cache-pressure KV footprint relation no longer holds")
+        long_64k_kv_tokens = full_length_kv_tokens(64512, 32)
         if not (
-            long_64k_entitlement <= 65536
-            and 2 * long_64k_entitlement > 65536
+            long_64k_kv_tokens <= 65536
+            and 2 * long_64k_kv_tokens > 65536
         ):
-            raise CorpusError("64K Host-swap entitlement relation no longer holds")
+            raise CorpusError("64K Host-swap KV footprint relation no longer holds")
+
+        rotation = [shapes[f"rotation-55k-{index}"] for index in range(6)]
+        if len({record["path"] for record in rotation}) != 6 or len(
+            {record["sha256"] for record in rotation}
+        ) != 6:
+            raise CorpusError("55K rotation shapes are not byte-distinct")
+        if any(record.get("max_peer_common_prefix_tokens", 4) > 3 for record in rotation):
+            raise CorpusError("55K rotation shapes do not diverge at the first content token")
+        original_labels: list[str] = []
+        for record in rotation:
+            messages = self._read_json(self._path(record))
+            if not isinstance(messages, list) or not messages:
+                raise CorpusError("55K rotation fixture has no messages")
+            system = messages[0].get("content") if isinstance(messages[0], dict) else None
+            original, separator, _ = system.partition(" ") if isinstance(system, str) else ("", "", "")
+            if not original or not separator:
+                raise CorpusError("55K rotation fixture has no system label")
+            original_labels.append(original)
+        if len(set(original_labels)) != len(rotation):
+            raise CorpusError("55K rotation system labels are not distinct")
+
+        second_labels: list[str] = []
+        for record, original in zip(rotation, original_labels, strict=True):
+            label = record.get("second_cohort_label")
+            if (
+                not isinstance(label, str)
+                or not label
+                or record.get("second_cohort_prompt_tokens") != 55000
+            ):
+                raise CorpusError("55K second-cohort shape facts are invalid")
+            if len(original) != len(label):
+                raise CorpusError("55K second-cohort label changes the frozen text shape")
+            second_labels.append(label)
+        if len(set(second_labels)) != len(rotation) or set(second_labels) & set(original_labels):
+            raise CorpusError("55K second-cohort roots are not distinct from the first cohort")
+        rotation_kv_tokens = full_length_kv_tokens(55000, 32)
+        if not 4 * rotation_kv_tokens <= 240000 < 5 * rotation_kv_tokens:
+            raise CorpusError("55K rotation Device-KV pressure relation no longer holds")
+
+        for label in "abcdef":
+            record = shapes.get(f"state-2k-{label}", {})
+            counts = record.get("probe_prompt_tokens", [])
+            if (
+                record.get("prompt_tokens") != 2048
+                or record.get("max_output_tokens") != 32
+                or record.get("max_peer_common_prefix_tokens", 4) > 3
+                or not 1900 < record.get("system_frontier_tokens", 0) < 2048
+                or not isinstance(record.get("probe_suffix"), str)
+                or len(counts) != 7
+                or counts[0] != 2048
+                or any(not isinstance(count, int) or count + 31 > 32768 for count in counts)
+            ):
+                raise CorpusError(f"state working-set geometry is invalid for {label}")
 
         for name in ("system-a", "system-b"):
             frontier = self.manifest["shared"][name]["marked_frontier_tokens"]
@@ -174,6 +231,14 @@ class Corpus:
         except KeyError as error:
             raise CorpusError(f"unknown shared fixture: {name}") from error
         return self._path(record).read_text(encoding="utf-8")
+
+    def state_messages(self, label: str, turn: int = 0) -> list[dict[str, Any]]:
+        facts = self.shape(f"state-2k-{label}")
+        if not 0 <= turn < len(facts["probe_prompt_tokens"]):
+            raise CorpusError("state working-set turn exceeds the frozen sequence")
+        messages = self.shape_messages(f"state-2k-{label}")
+        messages[-1]["content"] += facts["probe_suffix"] * turn
+        return messages
 
     def client_tools(self, *, changed_first: bool = False) -> list[dict[str, Any]]:
         record = self.manifest["shared"]["client-tools-32"]

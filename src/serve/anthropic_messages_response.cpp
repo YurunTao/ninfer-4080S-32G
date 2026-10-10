@@ -1,4 +1,5 @@
 #include "serve/anthropic_messages.h"
+#include "product/constraint_observation.h"
 
 #include "serve/generation_service.h"
 
@@ -17,7 +18,8 @@
 namespace ninfer::serve {
 namespace {
 
-using Json = nlohmann::json;
+using Json        = nlohmann::json;
+using OrderedJson = nlohmann::ordered_json;
 
 std::string random_identifier(const char* prefix) {
     static thread_local std::mt19937_64 random{std::random_device{}()};
@@ -43,8 +45,8 @@ std::vector<ToolCall> materialize_tool_calls(const GenerationOutcome& outcome) {
     return result;
 }
 
-Json parse_tool_input(const ToolCall& call) {
-    Json input = Json::parse(call.arguments_json, nullptr, false);
+OrderedJson parse_tool_input(const ToolCall& call) {
+    OrderedJson input = OrderedJson::parse(call.arguments_json, nullptr, false);
     if (input.is_discarded() || !input.is_object()) {
         throw std::logic_error("Engine produced non-object Anthropic tool input");
     }
@@ -57,7 +59,9 @@ struct StopPresentation {
 };
 
 StopPresentation stop_presentation(const GenerationOutcome& outcome) {
-    if (!outcome.tool_calls.empty()) { return StopPresentation{.reason = "tool_use"}; }
+    if (!outcome.tool_calls.empty() && (outcome.finish_reason == ninfer::FinishReason::StopToken ||
+                                        outcome.finish_reason == ninfer::FinishReason::None))
+        return StopPresentation{.reason = "tool_use"};
     switch (outcome.finish_reason) {
     case ninfer::FinishReason::OutputLimit:
         return StopPresentation{.reason = "max_tokens"};
@@ -169,8 +173,10 @@ ApiError normalize_anthropic_error(ApiError error) {
 
 std::string make_anthropic_error_body(const ApiError& api_error, const std::string& request_id) {
     const ApiError error = normalize_anthropic_error(api_error);
+    const std::string message =
+        error.param.empty() ? error.message : error.param + ": " + error.message;
     return Json{{"type", "error"},
-                {"error", Json{{"type", error.type}, {"message", error.message}}},
+                {"error", Json{{"type", error.type}, {"message", message}}},
                 {"request_id", request_id}}
         .dump();
 }
@@ -181,33 +187,36 @@ std::string make_anthropic_sse_error(const ApiError& error, const std::string& r
 }
 
 std::string make_anthropic_messages_response(const AnthropicResponseIdentity& identity,
-                                             const GenerationOutcome& outcome,
-                                             const AnthropicThinkingSigner& signer) {
-    Json content = Json::array();
+                                             const GenerationOutcome& outcome) {
+    OrderedJson content = OrderedJson::array();
     if (!outcome.reasoning.empty()) {
-        content.push_back(Json{{"type", "thinking"},
-                               {"thinking", outcome.reasoning},
-                               {"signature", signer.sign(outcome.reasoning, 0)}});
+        // Claude clients expect a non-empty opaque value. The response identity already has the
+        // required lifetime, so Thinking introduces no independent state or credential.
+        content.push_back(OrderedJson{{"type", "thinking"},
+                                      {"thinking", outcome.reasoning},
+                                      {"signature", identity.message_id}});
     }
     if (!outcome.text.empty()) {
-        content.push_back(Json{{"type", "text"}, {"text", outcome.text}});
+        content.push_back(OrderedJson{{"type", "text"}, {"text", outcome.text}});
     }
     for (const ToolCall& call : materialize_tool_calls(outcome)) {
-        content.push_back(Json{{"type", "tool_use"},
-                               {"id", call.id},
-                               {"name", call.name},
-                               {"input", parse_tool_input(call)}});
+        content.push_back(OrderedJson{{"type", "tool_use"},
+                                      {"id", call.id},
+                                      {"name", call.name},
+                                      {"input", parse_tool_input(call)}});
     }
     const StopPresentation stop = stop_presentation(outcome);
-    return Json{{"id", identity.message_id},
-                {"type", "message"},
-                {"role", "assistant"},
-                {"model", identity.model},
-                {"content", std::move(content)},
-                {"stop_reason", stop.reason},
-                {"stop_sequence", stop.sequence},
-                {"usage", final_usage(outcome)}}
-        .dump();
+    OrderedJson response{{"id", identity.message_id},
+                         {"type", "message"},
+                         {"role", "assistant"},
+                         {"model", identity.model},
+                         {"content", std::move(content)},
+                         {"stop_reason", stop.reason},
+                         {"stop_sequence", stop.sequence},
+                         {"usage", final_usage(outcome)}};
+    if (outcome.constraint)
+        response["constraint"] = product::constraint_observation_json(outcome.constraint);
+    return response.dump();
 }
 
 std::string make_anthropic_count_tokens_response(int input_tokens) {
@@ -215,8 +224,8 @@ std::string make_anthropic_count_tokens_response(int input_tokens) {
 }
 
 AnthropicMessagesStream::AnthropicMessagesStream(AnthropicResponseIdentity identity,
-                                                 int input_tokens, AnthropicThinkingSigner signer)
-    : identity_(std::move(identity)), signer_(std::move(signer)), input_tokens_(input_tokens) {}
+                                                 int input_tokens)
+    : identity_(std::move(identity)), input_tokens_(input_tokens) {}
 
 std::string AnthropicMessagesStream::start() { return start_with_cache(std::nullopt); }
 
@@ -270,16 +279,11 @@ std::vector<std::string> AnthropicMessagesStream::reasoning_delta(const std::str
 std::vector<std::string> AnthropicMessagesStream::close_thinking() {
     std::vector<std::string> events;
     if (!thinking_open_) { return events; }
-    if (!signature_sent_) {
-        events.push_back(event(
-            "content_block_delta",
-            Json{{"type", "content_block_delta"},
-                 {"index", thinking_index_},
-                 {"delta", Json{{"type", "signature_delta"},
-                                {"signature", signer_.sign(reasoning_, static_cast<std::size_t>(
-                                                                           thinking_index_))}}}}));
-        signature_sent_ = true;
-    }
+    events.push_back(event(
+        "content_block_delta",
+        Json{{"type", "content_block_delta"},
+             {"index", thinking_index_},
+             {"delta", Json{{"type", "signature_delta"}, {"signature", identity_.message_id}}}}));
     events.push_back(event("content_block_stop",
                            Json{{"type", "content_block_stop"}, {"index", thinking_index_}}));
     thinking_open_ = false;
@@ -352,10 +356,12 @@ std::vector<std::string> AnthropicMessagesStream::finish(const GenerationOutcome
     }
 
     const StopPresentation stop = stop_presentation(outcome);
-    events.push_back(event("message_delta", Json{{"type", "message_delta"},
-                                                 {"delta", Json{{"stop_reason", stop.reason},
-                                                                {"stop_sequence", stop.sequence}}},
-                                                 {"usage", final_usage(outcome)}}));
+    Json terminal{{"type", "message_delta"},
+                  {"delta", Json{{"stop_reason", stop.reason}, {"stop_sequence", stop.sequence}}},
+                  {"usage", final_usage(outcome)}};
+    if (outcome.constraint)
+        terminal["constraint"] = product::constraint_observation_json(outcome.constraint);
+    events.push_back(event("message_delta", std::move(terminal)));
     events.push_back(event("message_stop", Json{{"type", "message_stop"}}));
     finished_ = true;
     return events;

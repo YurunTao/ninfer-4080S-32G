@@ -17,7 +17,7 @@
 
 namespace {
 
-using Json = nlohmann::json;
+using Json = ninfer::serve::RequestJson;
 using namespace ninfer::serve;
 
 int check(bool condition, const std::string& message) {
@@ -152,12 +152,15 @@ int test_basic_request_and_resolution() {
                           resolved.generation.messages[0].content[0].text == "be concise" &&
                           resolved.generation.messages[1].content[0].text == "hello",
                       "instructions and current input composed in model order");
-    failures +=
-        check(resolved.session_key == "resp_current" &&
-                  resolved.cache_hints.session_key == "resp_current" &&
-                  resolved.cache_hints.retention == ninfer::CacheRetentionHint::LiveSession &&
-                  resolved.cache_hints.update_session_index,
-              "stored root response receives one live Engine session");
+    failures += check(resolved.session_key == "resp_current" &&
+                          resolved.cache_hints.session_key == "resp_current" &&
+                          resolved.cache_hints.update_session_index,
+                      "stored root response receives one live Engine session");
+    const OpenAIResponsesResolvedPrompt unstored =
+        resolve_openai_responses_prompt(request.prompt, store, "resp_unstored", false);
+    failures += check(!unstored.session_key && !unstored.cache_hints.session_key &&
+                          !unstored.cache_hints.update_session_index,
+                      "store=false root must not create or advance a named Engine session");
     return failures;
 }
 
@@ -297,6 +300,90 @@ int test_typed_items_and_cache_markers() {
     return failures;
 }
 
+int test_prompt_cache_policy_after_history_resolution() {
+    using Location = ninfer::PromptCacheMarkerLocation;
+    using Evidence = ninfer::SharedCandidateEvidence;
+    OpenAIResponsesStore store(8, 1ULL << 20);
+    const Json initial_body{
+        {"model", "m"},
+        {"input",
+         Json::array(
+             {Json{{"role", "user"},
+                   {"content",
+                    Json::array({Json{{"type", "input_text"},
+                                      {"text", "stable material"},
+                                      {"prompt_cache_breakpoint", Json{{"mode", "explicit"}}}},
+                                 Json{{"type", "input_text"}, {"text", "first question"}}})}}})}};
+    const auto initial = parse_openai_responses_create_request(initial_body, limits());
+    const auto first   = resolve_openai_responses_prompt(initial.prompt, store, "resp_first", true);
+    const auto first_prompt = to_prompt_input(first.generation, ResolvedPromptSemantics{}, {});
+    int failures            = 0;
+    failures +=
+        check(first_prompt.context_cache.markers.size() == 2 &&
+                  first_prompt.context_cache.markers[0].location == Location::MessagePartBoundary &&
+                  first_prompt.context_cache.markers[0].after_message_part_count == 1 &&
+                  first_prompt.context_cache.markers[0].evidence == Evidence::ExplicitBoundary &&
+                  first_prompt.context_cache.markers[1].location == Location::MessagePartBoundary &&
+                  first_prompt.context_cache.markers[1].after_message_part_count == 2 &&
+                  first_prompt.context_cache.markers[1].after_message_count == 1 &&
+                  first_prompt.context_cache.markers[1].evidence == Evidence::DefaultAutomatic,
+              "Responses chooses the final source part after assembling input");
+    failures += check(initial.prompt.input_turns.size() == 1 &&
+                          !initial.prompt.input_turns[0].cache_boundary_after &&
+                          initial.prompt.input_turns[0].content[0].cache_boundary_after &&
+                          !initial.prompt.input_turns[0].content[1].cache_boundary_after,
+                      "automatic writes do not modify the input history retained for storage");
+
+    auto stored_turns = initial.prompt.input_turns;
+    stored_turns.push_back(text_turn(ninfer::ChatRole::Assistant, "first answer"));
+    store.put(stored_parent(append_openai_response_context({}, std::move(stored_turns))));
+    Json followup_body{{"model", "m"},
+                       {"previous_response_id", "resp_parent"},
+                       {"instructions", "updated instruction"},
+                       {"input", "next question"}};
+    const auto followup = parse_openai_responses_create_request(followup_body, limits());
+    const auto second =
+        resolve_openai_responses_prompt(followup.prompt, store, "resp_second", true);
+    const auto second_prompt = to_prompt_input(second.generation, ResolvedPromptSemantics{}, {});
+    failures += check(
+        second_prompt.context_cache.markers.size() == 2 &&
+            second_prompt.context_cache.markers[0].location == Location::MessagePartBoundary &&
+            second_prompt.context_cache.markers[0].after_message_count == 2 &&
+            second_prompt.context_cache.markers[0].evidence == Evidence::ExplicitBoundary &&
+            second_prompt.context_cache.markers[1].location == Location::MessagePartBoundary &&
+            second_prompt.context_cache.markers[1].after_message_part_count == 1 &&
+            second_prompt.context_cache.markers[1].after_message_count == 4 &&
+            second_prompt.context_cache.markers[1].evidence == Evidence::DefaultAutomatic,
+        "previous_response_id preserves explicit history and caches only the new implicit tail");
+    const auto parent       = store.get("resp_parent");
+    const auto parent_turns = flatten_openai_response_context(parent->context);
+    failures +=
+        check(parent_turns.size() == 2 && !parent_turns[0].cache_boundary_after &&
+                  parent_turns[0].content[0].cache_boundary_after &&
+                  parent_turns[0].content[0].cache_boundary_after->evidence ==
+                      Evidence::ExplicitBoundary &&
+                  !parent_turns[0].content[1].cache_boundary_after &&
+                  !parent_turns[1].cache_boundary_after &&
+                  !parent_turns[1].content[0].cache_boundary_after &&
+                  !followup.prompt.input_turns[0].cache_boundary_after &&
+                  !followup.prompt.input_turns[0].content[0].cache_boundary_after,
+              "resolving a continuation does not inject automatic markers into stored history");
+
+    followup_body["prompt_cache_options"] = Json{{"mode", "explicit"}};
+    const auto explicit_request = parse_openai_responses_create_request(followup_body, limits());
+    const auto explicit_result =
+        resolve_openai_responses_prompt(explicit_request.prompt, store, "resp_explicit", true);
+    const auto explicit_prompt =
+        to_prompt_input(explicit_result.generation, ResolvedPromptSemantics{}, {});
+    failures += check(
+        explicit_prompt.context_cache.markers.size() == 1 &&
+            explicit_prompt.context_cache.markers[0].location == Location::MessagePartBoundary &&
+            explicit_prompt.context_cache.markers[0].after_message_count == 2 &&
+            !explicit_prompt.context_cache.allow_engine_automatic_shared_prefixes,
+        "explicit Responses mode keeps historical explicit markers without a new implicit write");
+    return failures;
+}
+
 int test_contiguous_assistant_items() {
     const Json body = {
         {"model", "m"},
@@ -392,8 +479,10 @@ int test_response_output_history_round_trip() {
     outcome.reasoning     = "I should inspect both paths.";
     outcome.text          = "Let me check:";
     outcome.finish_reason = ninfer::FinishReason::StopToken;
-    outcome.tool_calls.push_back(
-        ninfer::GeneratedToolCall{.name = "read_file", .arguments_json = R"({"path":"a"})"});
+    outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
+        .name = "Edit",
+        .arguments_json =
+            R"({"file_path":"/tmp/probe.cpp","old_string":"old","new_string":"new"})"});
     outcome.tool_calls.push_back(
         ninfer::GeneratedToolCall{.name = "read_file", .arguments_json = R"({"path":"b"})"});
     const BuiltOpenAIResponse built =
@@ -418,6 +507,14 @@ int test_response_output_history_round_trip() {
         check(built.output_history.size() == 1 && replay.prompt.input_turns.size() == 5 &&
                   same_assistant_turn(replay.prompt.input_turns[1], built.output_history[0]),
               "Responses output Items did not round-trip to their stored assistant history");
+    const auto edit_item =
+        std::find_if(built.output_items.begin(), built.output_items.end(), [](const Json& item) {
+            return item.at("type") == "function_call" && item.at("name") == "Edit";
+        });
+    failures += check(
+        edit_item != built.output_items.end() &&
+            !Json::parse(edit_item->at("arguments").get<std::string>()).contains("replace_all"),
+        "Responses output changed an omitted optional tool argument");
 
     GenerationOutcome incomplete;
     incomplete.reasoning     = "unfinished reasoning";
@@ -515,8 +612,9 @@ int test_tools_and_effective_subset() {
     const OpenAIResponsesCreateRequest request =
         parse_openai_responses_create_request(body, limits());
     int failures = 0;
-    failures += check(request.tools.size() == 2 && request.prompt.generation.tools.size() == 1 &&
-                          request.prompt.generation.tools[0].name == "clock",
+    failures += check(request.tools.size() == 2 && request.prompt.generation.tools.size() == 2 &&
+                          request.prompt.generation.tool_choice.allowed_names ==
+                              std::vector<std::string>{"clock"},
                       "wire tool list and effective callable subset remain distinct");
 
     Json none           = body;
@@ -526,6 +624,22 @@ int test_tools_and_effective_subset() {
     failures += check(disabled.prompt.generation.tool_choice.mode == ToolChoiceMode::None &&
                           !disabled.prompt.generation.uses_tools(),
                       "tool_choice none disables generation tools without deleting their echo");
+
+    const Json ordered = Json::parse(
+        R"({"model":"m","input":"probe","tools":[{"type":"function","name":"probe","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}}}]})");
+    const OpenAIResponsesCreateRequest ordered_request =
+        parse_openai_responses_create_request(ordered, limits());
+    failures += check(ordered_request.prompt.generation.constrains_tools() &&
+                          !to_request_options(ordered_request.prompt.generation, {}, {}, true)
+                               .output.preserve_special_tokens,
+                      "ordinary Responses tools did not select constrained output");
+    const ninfer::PromptInput ordered_prompt =
+        to_prompt_input(ordered_request.prompt.generation, ResolvedPromptSemantics{}, {});
+    failures += check(
+        ordered_prompt.options.tool_jsons.size() == 1 &&
+            ordered_prompt.options.tool_jsons.front() ==
+                R"({"type":"function","function":{"name":"probe","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}},"strict":false}})",
+        "OpenAI Responses changed tool-schema member order before PromptInput");
     return failures;
 }
 
@@ -561,11 +675,13 @@ int test_namespace_tools() {
     failures += check(request.tools.size() == 2 && request.tools[0].at("type") == "namespace" &&
                           request.tools[0].at("tools")[0].at("name") == "now",
                       "wire namespace grouping is retained in the response echo");
-    failures += check(request.prompt.generation.tools.size() == 1 &&
+    failures += check(request.prompt.generation.tools.size() == 2 &&
+                          request.prompt.generation.tool_choice.allowed_names ==
+                              std::vector<std::string>{"mcp__clock__now"} &&
                           request.prompt.generation.tools[0].name == "mcp__clock__now" &&
                           request.prompt.generation.tools[0].description ==
                               "Clock service\n\nRead the current time",
-                      "allowed namespace function lowers to one Engine tool with shared context");
+                      "namespace selection keeps all Engine declarations and shared context");
     failures +=
         check(request.tool_identities.at("mcp__clock__now").name == "now" &&
                   request.tool_identities.at("mcp__clock__now").wire_namespace == "mcp__clock",
@@ -754,17 +870,16 @@ int test_explicit_rejections() {
 
     Json value     = base;
     value["tools"] = Json::array({Json{{"type", "function"}, {"name", "f"}, {"strict", true}}});
-    failures += check(api_code([&] {
-                          (void)parse_openai_responses_create_request(value, limits());
-                      }) == "strict_tools_not_supported",
-                      "strict function schema is rejected explicitly");
+    failures += check(
+        parse_openai_responses_create_request(value, limits()).prompt.generation.tools[0].strict,
+        "strict function schema reaches generation");
 
     value         = base;
     value["text"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(api_code([&] {
+    failures += check(api_error([&] {
                           (void)parse_openai_responses_create_request(value, limits());
-                      }) == "structured_outputs_not_supported",
-                      "structured output is rejected explicitly");
+                      }).param == "text.format.name",
+                      "malformed output schema is rejected");
 
     value               = base;
     value["background"] = true;
@@ -835,11 +950,10 @@ int test_previous_response_call_graph() {
 
     const OpenAIResponsesResolvedPrompt disposable =
         resolve_openai_responses_prompt(request.prompt, store, "resp_disposable", false);
-    failures +=
-        check(disposable.session_key == "responses-session" &&
-                  disposable.cache_hints.retention == ninfer::CacheRetentionHint::Disposable &&
-                  !disposable.cache_hints.update_session_index,
-              "store=false consumes parent session without advancing it");
+    failures += check(disposable.session_key == "responses-session" &&
+                          disposable.cache_hints.session_key == "responses-session" &&
+                          !disposable.cache_hints.update_session_index,
+                      "store=false consumes parent session without advancing it");
 
     Json partial     = reordered_body;
     partial["input"] = Json::array(
@@ -926,6 +1040,19 @@ int test_response_object() {
                           tool_response.output_history[0].tool_calls[0].id ==
                               item.at("call_id").get<std::string>(),
                       "wire and continuation history share one stable function call_id");
+    tools.finish_reason = ninfer::FinishReason::OutputLimit;
+    const auto partial  = make_openai_response_object("resp_partial", 123, request, runtime, tools);
+    failures +=
+        check(partial.body.at("status") == "incomplete" && partial.body.at("output").size() == 1 &&
+                  partial.body.at("output")[0].at("arguments") == R"({"city":"Paris"})",
+              "truncation lost a completed call or hid the incomplete response");
+    OpenAIResponsesEventStream stream("resp_partial_stream", 123, request, runtime);
+    (void)stream.start();
+    const auto finish   = stream.finish(tools);
+    const auto terminal = parse_event(stream.terminal(finish.response));
+    failures += check(terminal.at("type") == "response.incomplete" &&
+                          terminal.at("response").at("output")[0].at("type") == "function_call",
+                      "streamed completed call hid a later truncation");
     return failures;
 }
 
@@ -938,7 +1065,10 @@ int test_sse_sequence_and_failures() {
     wire.insert(wire.end(), next.begin(), next.end());
     next = encoder.content_delta("ans");
     wire.insert(wire.end(), next.begin(), next.end());
-    OpenAIResponsesStreamFinish finish = encoder.finish(sample_outcome());
+    auto outcome       = sample_outcome();
+    outcome.constraint = ninfer::ConstraintObservation{
+        .branch = ninfer::ConstraintOutputBranch::Content, .complete = true, .terminated = true};
+    OpenAIResponsesStreamFinish finish = encoder.finish(outcome);
     wire.insert(wire.end(), finish.events_before_terminal.begin(),
                 finish.events_before_terminal.end());
     wire.push_back(encoder.terminal(finish.response));
@@ -960,6 +1090,11 @@ int test_sse_sequence_and_failures() {
                           parse_event(wire.back()).at("type") == "response.completed" &&
                           text_deltas == "answer",
                       "SSE starts, reconstructs output, and terminates canonically");
+    failures +=
+        check(parse_event(wire.back())["response"]["constraint"]["complete"] == true &&
+                  parse_event(wire.back())["response"]["constraint"]["terminated"] == true &&
+                  !parse_event(wire.front())["response"].contains("constraint"),
+              "Responses constraint state must appear in the terminal response");
 
     OpenAIResponsesEventStream failed("resp_failed", 123, std::move(request), {});
     (void)failed.start();
@@ -1011,9 +1146,73 @@ int test_input_tokens_uses_shared_state_path() {
     failures += check(resolved.generation.tools.size() == 1 &&
                           resolved.generation.tools[0].name == "mcp__clock__now",
                       "input token counting uses the namespace tool translation path");
-    failures += check(Json::parse(make_openai_response_input_tokens_body(9)) ==
-                          Json{{"object", "response.input_tokens"}, {"input_tokens", 9}},
+    const auto counted_prompt = to_prompt_input(resolved.generation, ResolvedPromptSemantics{}, {});
+    failures += check(counted_prompt.context_cache.markers.empty() &&
+                          !counted_prompt.context_cache.allow_engine_automatic_shared_prefixes,
+                      "input token counting does not create automatic cache writes");
+    failures += check(nlohmann::json::parse(make_openai_response_input_tokens_body(9)) ==
+                          nlohmann::json{{"object", "response.input_tokens"}, {"input_tokens", 9}},
                       "input token count response shape");
+    return failures;
+}
+
+int test_constrained_decoding() {
+    int failures = 0;
+    Json body{{"model", "qwen"},
+              {"input", "hello"},
+              {"structured_outputs", {{"grammar", "root ::= \"yes\""}}}};
+    const auto request = parse_openai_responses_create_request(body, limits());
+    OpenAIResponsesStore store(8, 1024 * 1024);
+    for (const auto& value : {Json{{"choice", {"yes", "no"}}}, Json{{"regex", "[a-z]+"}}}) {
+        auto changed                  = body;
+        changed["structured_outputs"] = value;
+        const auto parsed             = parse_openai_responses_create_request(changed, limits());
+        const auto selected =
+            resolve_openai_responses_prompt(parsed.prompt, store, std::nullopt, false);
+        failures +=
+            check(to_request_options(selected.generation, {}, {}, true).constraint ==
+                      (value.contains("choice") ? ninfer::OutputConstraint::choice({"yes", "no"})
+                                                : ninfer::OutputConstraint::regex("[a-z]+")),
+                  "Responses choice/regex lost through prompt resolution");
+    }
+    const auto resolved =
+        resolve_openai_responses_prompt(request.prompt, store, std::nullopt, false);
+    failures += check(to_request_options(resolved.generation, {}, {}, true).constraint->source ==
+                          "root ::= \"yes\"",
+                      "Responses GBNF extension was lost in resolution or Engine translation");
+    body["tools"] = Json::array({Json{{"type", "function"}, {"name", "lookup"}}});
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_create_request(body, limits());
+                      }).param == "structured_outputs.grammar",
+                      "grammar admitted active tools");
+    body["tool_choice"] = "none";
+    failures += check(parse_openai_responses_create_request(body, limits())
+                              .prompt.generation.constraint->source == "root ::= \"yes\"",
+                      "inactive tools blocked grammar");
+    body["structured_outputs"] = Json{{"grammar", ""}};
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_create_request(body, limits());
+                      }).param == "structured_outputs.grammar",
+                      "empty grammar was accepted");
+    body                      = Json{{"model", "qwen"},
+                                     {"input", "hello"},
+                                     {"text",
+                                      {{"format",
+                                        {{"type", "json_schema"},
+                                         {"name", "answer"},
+                                         {"strict", true},
+                                         {"schema", {{"type", "object"}}}}}}}};
+    const auto schema_request = parse_openai_responses_create_request(body, limits());
+    const auto response =
+        make_openai_response_object("resp_test", 1, schema_request, {}, sample_outcome());
+    failures += check(response.body["text"]["format"] == schema_request.text_format &&
+                          schema_request.prompt.generation.constraint_param == "text.format.schema",
+                      "Responses format echo or source path lost");
+    body["tools"]       = Json::array({Json{{"type", "function"}, {"name", "lookup"}}});
+    const auto combined = parse_openai_responses_create_request(body, limits()).prompt.generation;
+    failures += check(combined.constraint && combined.uses_tools() &&
+                          combined.tools[0].schema_param == "tools/0/parameters",
+                      "Responses JSON/tool composition or diagnostic origin lost");
     return failures;
 }
 
@@ -1021,9 +1220,11 @@ int test_input_tokens_uses_shared_state_path() {
 
 int main() {
     int failures = 0;
+    failures += test_constrained_decoding();
     failures += test_basic_request_and_resolution();
     failures += test_budgets_and_nonsemantic_hints();
     failures += test_typed_items_and_cache_markers();
+    failures += test_prompt_cache_policy_after_history_resolution();
     failures += test_contiguous_assistant_items();
     failures += test_response_output_history_round_trip();
     failures += test_assistant_item_boundaries_and_errors();

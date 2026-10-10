@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "ninfer/ops/sparse_moe.h"
 
 #include "ops/op_tester.h"
@@ -59,13 +60,13 @@ struct QuantGeometry {
 
 QuantGeometry quant_geometry(QType qtype) {
     switch (qtype) {
-    case QType::Q4G64_F16S:
+    case QType::Q4_G64_FP16:
         return {64, 32, 0};
-    case QType::Q5G64_F16S:
+    case QType::Q5_G64_FP16:
         return {64, 32, 8};
-    case QType::Q6G64_F16S:
+    case QType::Q6_G64_FP16:
         return {64, 32, 16};
-    case QType::W8G32_F16S:
+    case QType::Q8_G32_FP16:
         return {32, 32, 0};
     default:
         throw std::invalid_argument("sparse_moe test: unsupported codec");
@@ -214,7 +215,7 @@ Weight dense_bf16_weight(void* data, std::int32_t rows, std::int32_t columns) {
     Weight result{};
     result.payload         = data;
     result.payload_bytes   = static_cast<std::uint64_t>(rows) * columns * sizeof(std::uint16_t);
-    result.qtype           = QType::BF16_CTRL;
+    result.qtype           = QType::BF16;
     result.qdata           = data;
     result.n               = rows;
     result.k               = columns;
@@ -448,8 +449,8 @@ public:
           device_router_(to_device(router_bits_)),
           routed_gate_(profile.routed_gate_up, kRoutedGateRows, kHidden),
           routed_down_(profile.routed_down, kRoutedDownRows, kIntermediate),
-          shared_gate_(QType::W8G32_F16S, kSharedGateRows, kHidden),
-          shared_down_device_(QType::W8G32_F16S, kHidden, kIntermediate) {
+          shared_gate_(QType::Q8_G32_FP16, kSharedGateRows, kHidden),
+          shared_down_device_(QType::Q8_G32_FP16, kHidden, kIntermediate) {
         for (int pattern = 0; pattern < static_cast<int>(kRoutePatterns.size()); ++pattern) {
             inputs_.push_back(make_input(pattern));
             residuals_.push_back(make_residual(pattern));
@@ -479,9 +480,9 @@ public:
             experts_.push_back({expert, std::move(gate_up), std::move(down)});
         }
 
-        shared_gate_host_ = quantized_weight::pack_w8g32_row_split(
+        shared_gate_host_ = quantized_weight::pack_q8_g32_row_split(
             make_gate_up(kSharedGateRows, kHidden, 0x512U, 0.93f), kSharedGateRows, kHidden);
-        shared_down_host_ = quantized_weight::pack_w8g32_row_split(
+        shared_down_host_ = quantized_weight::pack_q8_g32_row_split(
             make_down(kHidden, kIntermediate, 0x731U, 0.87f), kHidden, kIntermediate);
         shared_gate_.copy_rows(shared_gate_host_, 0);
         shared_down_device_.copy_rows(shared_down_host_, 0);
@@ -493,7 +494,8 @@ public:
         }
     }
 
-    int run(std::int32_t tokens, int first_pattern, bool graph_replay) {
+    int run(DeviceExecutionView execution, std::int32_t tokens, int first_pattern,
+            bool graph_replay) {
         const std::string label = std::string(profile_.name) + " T=" + std::to_string(tokens);
         std::vector<float> input(static_cast<std::size_t>(kHidden) * tokens);
         std::vector<float> residual(static_cast<std::size_t>(kHidden) * tokens);
@@ -530,6 +532,20 @@ public:
             weights.routed_gate_up.qtype, weights.routed_down.qtype, tokens, tokens);
         WorkspaceArena workspace(workspace_bytes);
 
+        if (tokens == 1 && profile_.verify_graph_replay) {
+            for (const std::int32_t sm_count : {0, -1}) {
+                bool rejected = false;
+                try {
+                    ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination,
+                                    workspace, {execution.stream, sm_count});
+                } catch (const std::invalid_argument&) { rejected = true; }
+                if (!rejected) {
+                    std::cerr << label << ": accepted a nonpositive physical SM count\n";
+                    return 1;
+                }
+            }
+        }
+
         if (graph_replay) {
             cudaStream_t stream  = nullptr;
             cudaGraph_t graph    = nullptr;
@@ -542,7 +558,7 @@ public:
                                        cudaMemcpyDeviceToDevice, stream),
                        "capture SparseMoe residual seed");
             ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination, workspace,
-                            stream);
+                            execution.on_stream(stream));
             cuda_check(cudaStreamEndCapture(stream, &graph), "end SparseMoe graph capture");
             cuda_check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0),
                        "instantiate SparseMoe graph");
@@ -554,7 +570,7 @@ public:
             cuda_check(cudaStreamDestroy(stream), "destroy SparseMoe graph stream");
         } else {
             ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination, workspace,
-                            nullptr);
+                            execution);
             cuda_synchronize();
         }
 
@@ -607,7 +623,7 @@ private:
     std::vector<std::vector<double>> references_;
 };
 
-int run_profile(const CodecProfile& profile) {
+int run_profile(DeviceExecutionView execution, const CodecProfile& profile) {
     SparseMoeFixture fixture(profile);
     int failures        = 0;
     std::size_t witness = 0;
@@ -618,8 +634,8 @@ int run_profile(const CodecProfile& profile) {
                                   profile.routed_gate_up, profile.routed_down, tokens, tokens));
         // Decode starts with the exact top-8 boundary tie; multi-token cases cycle the tie,
         // high/low expert ids, and a different ordering of the same experts.
-        failures +=
-            fixture.run(tokens, index == 0 ? 1 : 0, profile.verify_graph_replay && index == 1);
+        failures += fixture.run(execution, tokens, index == 0 ? 1 : 0,
+                                profile.verify_graph_replay && index == 1);
     }
     const std::size_t interval = ops::sparse_moe_workspace_capacity_bytes(
         profile.routed_gate_up, profile.routed_down, 1, profile.token_cases.back());
@@ -644,15 +660,18 @@ int main() {
     // and one call crossing the 4096-token internal slice without observing any private plan.
     constexpr std::array<std::int32_t, 6> kQ4Q5Tokens{{1, 2, 46, 47, 768, 4097}};
     constexpr std::array<std::int32_t, 5> kQ4Q6Tokens{{1, 2, 46, 47, 768}};
-    constexpr std::array<std::int32_t, 5> kW8W8Tokens{{1, 2, 19, 20, 768}};
+    constexpr std::array<std::int32_t, 5> kQ8Q8Tokens{{1, 2, 19, 20, 768}};
     const std::array<CodecProfile, 3> profiles{{
-        {"sparse_moe q4+q5 a16", QType::Q4G64_F16S, QType::Q5G64_F16S, kQ4Q5Tokens, true},
-        {"sparse_moe q4+q6 a16", QType::Q4G64_F16S, QType::Q6G64_F16S, kQ4Q6Tokens, false},
-        {"sparse_moe w8+w8 a16", QType::W8G32_F16S, QType::W8G32_F16S, kW8W8Tokens, false},
+        {"sparse_moe q4+q5 a16", QType::Q4_G64_FP16, QType::Q5_G64_FP16, kQ4Q5Tokens, true},
+        {"sparse_moe q4+q6 a16", QType::Q4_G64_FP16, QType::Q6_G64_FP16, kQ4Q6Tokens, false},
+        {"sparse_moe q8+q8 a16", QType::Q8_G32_FP16, QType::Q8_G32_FP16, kQ8Q8Tokens, false},
     }};
 
-    int failures = 0;
-    for (const CodecProfile& profile : profiles) { failures += run_profile(profile); }
+    DeviceContext context;
+    // Fixture copies use the default stream; preserve their ordering with the eager call.
+    const DeviceExecutionView execution = context.execution_view().on_stream(nullptr);
+    int failures                        = 0;
+    for (const CodecProfile& profile : profiles) { failures += run_profile(execution, profile); }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe correctness\n";
     return failures == 0 ? 0 : 1;
 }

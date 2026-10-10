@@ -46,6 +46,60 @@
       "max_output_tokens": 32,
       "seed_common_prefix_tokens": 3
     },
+    "rotation-55k-0": {
+      "path": "bench/fixtures/ttft/text/rotation_55k_0.json",
+      "sha256": "b00be51579f76f06bdd4d3641d185bfb43350d71a75858f8eae83ec32492dbe6",
+      "prompt_tokens": 55000,
+      "max_output_tokens": 32,
+      "max_peer_common_prefix_tokens": 3,
+      "second_cohort_label": "OMEGA",
+      "second_cohort_prompt_tokens": 55000
+    },
+    "rotation-55k-1": {
+      "path": "bench/fixtures/ttft/text/rotation_55k_1.json",
+      "sha256": "4170d17d17733ca23c9d52449d58232fe72c79356f991577a39f5d8591d8dcb8",
+      "prompt_tokens": 55000,
+      "max_output_tokens": 32,
+      "max_peer_common_prefix_tokens": 3,
+      "second_cohort_label": "SIGMA",
+      "second_cohort_prompt_tokens": 55000
+    },
+    "rotation-55k-2": {
+      "path": "bench/fixtures/ttft/text/rotation_55k_2.json",
+      "sha256": "1274f6f889e233189a6b870e03de63b7237ec9c1c407b48c4fc94f95415496d9",
+      "prompt_tokens": 55000,
+      "max_output_tokens": 32,
+      "max_peer_common_prefix_tokens": 3,
+      "second_cohort_label": "VIOLET",
+      "second_cohort_prompt_tokens": 55000
+    },
+    "rotation-55k-3": {
+      "path": "bench/fixtures/ttft/text/rotation_55k_3.json",
+      "sha256": "5bfe7c1c610640e785391153f6680e7178c057fdc2026dbbff356f8499e366d1",
+      "prompt_tokens": 55000,
+      "max_output_tokens": 32,
+      "max_peer_common_prefix_tokens": 3,
+      "second_cohort_label": "THETA",
+      "second_cohort_prompt_tokens": 55000
+    },
+    "rotation-55k-4": {
+      "path": "bench/fixtures/ttft/text/rotation_55k_4.json",
+      "sha256": "23829a48cfe472ce35e79b1b9b9558d05af7ed8fbe58956f894736f459270099",
+      "prompt_tokens": 55000,
+      "max_output_tokens": 32,
+      "max_peer_common_prefix_tokens": 3,
+      "second_cohort_label": "APPLE",
+      "second_cohort_prompt_tokens": 55000
+    },
+    "rotation-55k-5": {
+      "path": "bench/fixtures/ttft/text/rotation_55k_5.json",
+      "sha256": "747ab03b82f70f542b6d45828e4345ecf192139a0043d994cf7ffae522f3cab9",
+      "prompt_tokens": 55000,
+      "max_output_tokens": 32,
+      "max_peer_common_prefix_tokens": 3,
+      "second_cohort_label": "CHARLIE",
+      "second_cohort_prompt_tokens": 55000
+    },
     "long-256k-32": {
       "path": "examples/cli/messages/long_niah_256k.json",
       "sha256": "73278973a82c80f5be8bcc7d4c89afd8bdd3edfe82e8900952cb4a7660cd9644",
@@ -63,12 +117,6 @@
       "sha256": "acbd46f48862d36b116f79f98bf6b6e61d177cbee1b48831bca25438293f9cf7",
       "prompt_tokens": 127,
       "max_output_tokens": 4096
-    },
-    "medium-3000": {
-      "path": "examples/cli/messages/text_smoke_zh.json",
-      "sha256": "c5d5a16e3dd26a47c67a5da30b803739404611dafe1e753a9ccb982befb3ac7a",
-      "prompt_tokens": 30,
-      "max_output_tokens": 3000
     },
     "context-exact": {
       "path": "bench/fixtures/ttft/text/context_exact.json",
@@ -94,6 +142,114 @@
       "prompt_tokens": 4321,
       "common_prefix_tokens": 4306,
       "max_output_tokens": 32
+    },
+    "state-2k-a": {
+      "path": "bench/fixtures/ttft/text/state_working_set_a.json",
+      "sha256": "9c265610226e9d56563f30aa69ba5508c44c6181cf34c5bece6bb64ec302401a",
+      "prompt_tokens": 2048,
+      "max_output_tokens": 32,
+      "system_frontier_tokens": 2026,
+      "probe_suffix": "\nInclude one more detail.",
+      "probe_prompt_tokens": [
+        2048,
+        2054,
+        2060,
+        2066,
+        2072,
+        2078,
+        2084
+      ],
+      "max_peer_common_prefix_tokens": 3
+    },
+    "state-2k-b": {
+      "path": "bench/fixtures/ttft/text/state_working_set_b.json",
+      "sha256": "16b6851f5f8edbbc6e5756e080cf95ca59ce071c82d49029c6b724b51c576321",
+      "prompt_tokens": 2048,
+      "max_output_tokens": 32,
+      "system_frontier_tokens": 2026,
+      "probe_suffix": "\nInclude one more detail.",
+      "probe_prompt_tokens": [
+        2048,
+        2054,
+        2060,
+        2066,
+        2072,
+        2078,
+        2084
+      ],
+      "max_peer_common_prefix_tokens": 3
+    },
+    "state-2k-c": {
+      "path": "bench/fixtures/ttft/text/state_working_set_c.json",
+      "sha256": "3459edcefb104777c94f53feac65cb98cac687c0463af84b7858eeca902d6f13",
+      "prompt_tokens": 2048,
+      "max_output_tokens": 32,
+      "system_frontier_tokens": 2026,
+      "probe_suffix": "\nInclude one more detail.",
+      "probe_prompt_tokens": [
+        2048,
+        2054,
+        2060,
+        2066,
+        2072,
+        2078,
+        2084
+      ],
+      "max_peer_common_prefix_tokens": 3
+    },
+    "state-2k-d": {
+      "path": "bench/fixtures/ttft/text/state_working_set_d.json",
+      "sha256": "dda66d2c124bea448f42dd58cc8f35b91837305efc945ebe42a1db2f2c8517bc",
+      "prompt_tokens": 2048,
+      "max_output_tokens": 32,
+      "system_frontier_tokens": 2026,
+      "probe_suffix": "\nInclude one more detail.",
+      "probe_prompt_tokens": [
+        2048,
+        2054,
+        2060,
+        2066,
+        2072,
+        2078,
+        2084
+      ],
+      "max_peer_common_prefix_tokens": 3
+    },
+    "state-2k-e": {
+      "path": "bench/fixtures/ttft/text/state_working_set_e.json",
+      "sha256": "31b3a1cbb298414e49aab10023cc0f5933f53a4be0b59d7529106fbeadc6eab9",
+      "prompt_tokens": 2048,
+      "max_output_tokens": 32,
+      "system_frontier_tokens": 2026,
+      "probe_suffix": "\nInclude one more detail.",
+      "probe_prompt_tokens": [
+        2048,
+        2054,
+        2060,
+        2066,
+        2072,
+        2078,
+        2084
+      ],
+      "max_peer_common_prefix_tokens": 3
+    },
+    "state-2k-f": {
+      "path": "bench/fixtures/ttft/text/state_working_set_f.json",
+      "sha256": "75cdd4d706492c3ed702e1a0f608478300269fe08767c91c631cf86644514e9e",
+      "prompt_tokens": 2048,
+      "max_output_tokens": 32,
+      "system_frontier_tokens": 2026,
+      "probe_suffix": "\nInclude one more detail.",
+      "probe_prompt_tokens": [
+        2048,
+        2054,
+        2060,
+        2066,
+        2072,
+        2078,
+        2084
+      ],
+      "max_peer_common_prefix_tokens": 3
     }
   },
   "shared": {

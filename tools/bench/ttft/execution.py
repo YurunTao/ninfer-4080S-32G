@@ -6,7 +6,6 @@ import json
 import threading
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from tools.ninfer_serve.client import (
@@ -16,6 +15,7 @@ from tools.ninfer_serve.client import (
     ProtocolRequest,
     ServeExchangeResult,
 )
+from tools.streaming_http.client import HttpResponseHead
 
 
 class CaseExecutionError(RuntimeError):
@@ -29,9 +29,67 @@ ProgressCallback = Callable[[str, int, dict[str, Any]], None]
 class FailedCondition:
     expression: str
     detail: str
+    dimension: str = "construction"
 
     def as_json(self) -> dict[str, str]:
-        return {"expression": self.expression, "detail": self.detail}
+        return {
+            "expression": self.expression,
+            "detail": self.detail,
+            "dimension": self.dimension,
+        }
+
+
+def _event_metadata(event: ProtocolEvent) -> dict[str, Any]:
+    """Keep wire semantics without repeating accumulated response text in every record."""
+    payload = event.payload or {}
+    metadata = {
+        key: payload[key]
+        for key in ("sequence_number", "output_index", "content_index", "item_id", "index")
+        if key in payload
+    }
+    response = payload.get("response")
+    message = payload.get("message")
+    nested = response if isinstance(response, dict) else message
+    if not isinstance(nested, dict):
+        nested = payload
+    usage = nested.get("usage")
+    if isinstance(usage, dict):
+        metadata["usage"] = usage
+    for key in ("status", "incomplete_details", "stop_reason"):
+        if nested.get(key) is not None:
+            metadata[key] = nested[key]
+    delta = payload.get("delta")
+    if isinstance(delta, dict):
+        metadata["delta_type"] = delta.get("type")
+        if delta.get("stop_reason") is not None:
+            metadata["stop_reason"] = delta["stop_reason"]
+    choices = payload.get("choices")
+    if isinstance(choices, list):
+        metadata["choices"] = [
+            {
+                "index": choice.get("index"),
+                "finish_reason": choice.get("finish_reason"),
+                "channels": [
+                    key for key in ("content", "reasoning_content", "tool_calls")
+                    if isinstance(choice.get("delta"), dict) and choice["delta"].get(key)
+                ],
+            }
+            for choice in choices if isinstance(choice, dict)
+        ]
+    return metadata
+
+
+def _usage_counts(protocol: str, usage: dict[str, Any]) -> dict[str, int]:
+    names = (
+        ("prompt_tokens", "completion_tokens")
+        if protocol == "openai_chat"
+        else ("input_tokens", "output_tokens")
+    )
+    return {
+        target: usage[source]
+        for target, source in zip(("input_tokens", "output_tokens"), names)
+        if type(usage.get(source)) is int and usage[source] >= 0
+    }
 
 
 class RequestHandle:
@@ -54,12 +112,16 @@ class RequestHandle:
         self._thread_error: str | None = None
         self._event_trace: list[dict[str, Any]] = []
         self._output_parts: list[str] = []
+        self._usage: dict[str, int] = {}
+        self._wire_request_id: str | None = None
 
         self.sent_ns: int | None = None
         self.body_sent_ns: int | None = None
         self.accepted_ns: int | None = None
         self.first_output_ns: int | None = None
         self.completed_ns: int | None = None
+        self.terminal_ns: int | None = None
+        self.ended_ns: int | None = None
         self.cancel_ns: int | None = None
         self.response_id: str | None = None
 
@@ -121,12 +183,22 @@ class RequestHandle:
             body_bytes=self._prepared.body_bytes,
         )
 
+    def _on_headers(self, head: HttpResponseHead) -> None:
+        with self._lock:
+            self._wire_request_id = head.headers.get("x-request-id") or head.headers.get("request-id")
+
     def _on_event(self, event: ProtocolEvent) -> None:
         with self._lock:
+            is_output = event.kind == "model_output" and bool(event.output)
             first_accepted = event.kind == "accepted" and self.accepted_ns is None
-            first_output = event.kind == "model_output" and self.first_output_ns is None
-            first_terminal = event.kind in {"terminal", "error"} and self.completed_ns is None
-            if first_accepted or first_output or first_terminal:
+            first_output = is_output and self.first_output_ns is None
+            first_terminal = event.kind in {"terminal", "error"} and self.terminal_ns is None
+            metadata = _event_metadata(event)
+            usage = metadata.get("usage")
+            if isinstance(usage, dict):
+                # Protocol usage counters are cumulative, including Anthropic message_delta.
+                self._usage.update(_usage_counts(self.protocol, usage))
+            if event.kind != "model_output" or is_output:
                 self._event_trace.append(
                     {
                         "kind": event.kind,
@@ -135,6 +207,7 @@ class RequestHandle:
                         "response_id": event.response_id,
                         "output_bytes": len(event.output.encode("utf-8")),
                         "error_code": event.error_code,
+                        "metadata": metadata,
                     }
                 )
             if event.response_id:
@@ -142,12 +215,13 @@ class RequestHandle:
             if event.kind == "accepted" and self.accepted_ns is None:
                 self.accepted_ns = event.received_ns
                 self._accepted.set()
-            elif event.kind == "model_output":
+            elif is_output:
                 self._output_parts.append(event.output)
                 if self.first_output_ns is None:
                     self.first_output_ns = event.received_ns
                     self._first_output.set()
-            elif event.kind in {"terminal", "error"} and self.completed_ns is None:
+            elif first_terminal:
+                self.terminal_ns = event.received_ns
                 self.completed_ns = event.received_ns
                 self._completed.set()
             sent_ns = self.sent_ns
@@ -186,22 +260,17 @@ class RequestHandle:
             result = self._prepared.execute(
                 on_sent=self._on_sent,
                 on_body_sent=self._on_body_sent,
+                on_headers=self._on_headers,
                 on_event=self._on_event,
             )
             with self._lock:
                 self._result = result
+                self.ended_ns = result.http.ended_ns
                 if self.sent_ns is None:
                     self.sent_ns = result.http.sent_ns
                 if self.body_sent_ns is None:
                     self.body_sent_ns = result.http.body_sent_ns
-                if self.completed_ns is None and (
-                    not self.stream
-                    or result.http.cancelled
-                    or result.http.error is not None
-                    or result.http.status is None
-                    or not (200 <= result.http.status < 300)
-                    or result.protocol_error is not None
-                ):
+                if self.completed_ns is None:
                     self.completed_ns = result.http.ended_ns
                 if result.http.cancelled:
                     self.cancel_ns = result.http.cancel_ns or self._prepared.cancel_ns
@@ -209,8 +278,9 @@ class RequestHandle:
             message = f"{type(error).__name__}: {error}"
             with self._lock:
                 self._thread_error = message
+                self.ended_ns = time.perf_counter_ns()
                 if self.completed_ns is None:
-                    self.completed_ns = time.perf_counter_ns()
+                    self.completed_ns = self.ended_ns
             self._progress("request.error", error=message)
         finally:
             if self.sent_ns is not None:
@@ -247,14 +317,19 @@ class RequestHandle:
             self._progress("request.started", gated=gate is not None)
             self._thread.start()
 
-    def cancel(self) -> int:
-        timestamp = self._prepared.cancel()
+    def cancel(self, *, only_if_unrequested: bool = False) -> int | None:
         with self._lock:
+            if only_if_unrequested and (
+                self.cancel_ns is not None or self._prepared.cancel_ns is not None
+            ):
+                return None
+            timestamp = self._prepared.cancel()
             if self.cancel_ns is None:
                 self.cancel_ns = timestamp
             never_started = self._thread is None
             if never_started and self.completed_ns is None:
                 self.completed_ns = timestamp
+                self.ended_ns = timestamp
         if never_started:
             self._completed.set()
             self._done.set()
@@ -373,7 +448,7 @@ class RequestHandle:
             return "protocol_error"
         if not self.stream:
             return "nonstream_success"
-        if result.error_code is not None:
+        if result.error_code is not None or any(event.kind == "error" for event in result.events):
             return "failed_before_first" if first is None else "stream_error"
         if first is None:
             return "failed_before_first"
@@ -382,38 +457,65 @@ class RequestHandle:
             return "incomplete_stream"
         return "success"
 
-    def as_record(self) -> dict[str, Any]:
+    def as_record(self, *, freeze_input: bool = False) -> dict[str, Any]:
         with self._lock:
             result = self._result
             event_trace = list(self._event_trace)
             thread_error = self._thread_error
-            output_bytes = len("".join(self._output_parts).encode("utf-8"))
+            output_text = "".join(self._output_parts)
+            output_bytes = len(output_text.encode("utf-8"))
+            usage = dict(self._usage)
+            wire_request_id = self._wire_request_id
         sent = self.sent_ns
         first = self.first_output_ns
         ttft_ns = first - sent if isinstance(sent, int) and isinstance(first, int) else None
         http = result.http if result is not None else None
+        output_times = [
+            event["received_ns"] for event in event_trace if event["kind"] == "model_output"
+        ]
+        output_gaps = [right - left for left, right in zip(output_times, output_times[1:])]
+        last_output = output_times[-1] if output_times else None
+        terminal = self.terminal_ns
+        ended = self.ended_ns
         return {
             "role": self.role,
             "order": self.order,
             "protocol": self.protocol,
             "stream": self.stream,
             "body_bytes": self._prepared.body_bytes,
+            # Only the final case record decodes the exact sent body. Progress snapshots borrow
+            # the input object without copying large payloads during concurrent measured work.
+            "request_payload": json.loads(self._prepared.body) if freeze_input
+                               else self._prepared.request.payload,
             "sent_ns": sent,
             "body_sent_ns": self.body_sent_ns,
             "accepted_ns": self.accepted_ns,
             "first_output_ns": first,
             "completed_ns": self.completed_ns,
+            "terminal_ns": terminal,
+            "ended_ns": ended,
+            "last_output_ns": last_output,
             "cancel_ns": self.cancel_ns,
             "cancel_requested": (
                 http.cancel_requested if http is not None else self.cancel_ns is not None
             ),
             "transport_cancelled": http.cancelled if http is not None else False,
             "ttft_ns": ttft_ns,
+            "terminal_latency_ns": terminal - sent if terminal is not None and sent is not None else None,
+            "transport_duration_ns": ended - sent if ended is not None and sent is not None else None,
+            "output_event_count": len(output_times),
+            "output_gap_ns": output_gaps,
+            "max_output_gap_ns": max(output_gaps) if output_gaps else None,
+            "terminal_tail_ns": terminal - last_output if terminal is not None and last_output is not None else None,
+            "unterminated_tail_ns": ended - last_output if terminal is None and ended is not None and last_output is not None else None,
             "outcome": self.outcome(),
             "http_status": http.status if http is not None else None,
             "http_reason": http.reason if http is not None else None,
             "response_id": self.response_id,
+            "wire_request_id": wire_request_id,
+            "usage": usage,
             "output_bytes": output_bytes,
+            "output_text": output_text,
             "error_code": result.error_code if result is not None else None,
             "error_message": result.error_message if result is not None else None,
             "transport_error": http.error if http is not None else None,
@@ -429,13 +531,12 @@ class CaseContext:
         model: str,
         timeout_seconds: float,
         on_progress: ProgressCallback | None = None,
-        request_log_path: Path | None = None,
     ) -> None:
         self.client = client
         self.model = model
         self.timeout = timeout_seconds
         self._on_progress = on_progress
-        self.request_log_path = request_log_path
+        self._handles_lock = threading.Lock()
         self.handles: list[RequestHandle] = []
         self.failures: list[FailedCondition] = []
         self.notes: dict[str, Any] = {}
@@ -444,82 +545,31 @@ class CaseContext:
         if self._on_progress is not None:
             self._on_progress(stage, time.perf_counter_ns(), fields)
 
-    def request_log_entry(
-        self,
-        *,
-        media_item_count: int | None = None,
-        poll_seconds: float | None = None,
-    ) -> dict[str, Any] | None:
-        """The server request-log `request_start` record for one request, if logged.
-
-        The Serve request log records the preparation statistics (including
-        `preparation_seconds.media_items_dropped` for the aggregate Vision trim) only
-        after request preparation, before generation. Returns None when no request log
-        is wired for this run; `poll_seconds` bounds the wait for the flushed line.
-        """
-        if self.request_log_path is None:
-            return None
-        deadline = time.monotonic() + max(0.0, poll_seconds) if poll_seconds is not None else None
-        while True:
-            entry = self._read_request_log_entry(media_item_count)
-            if entry is not None or deadline is None or time.monotonic() >= deadline:
-                return entry
-            time.sleep(min(0.25, max(0.05, deadline - time.monotonic())))
-
-    def _read_request_log_entry(
-        self, media_item_count: int | None
-    ) -> dict[str, Any] | None:
-        path = self.request_log_path
-        if path is None or not path.is_file():
-            return None
-        entry: dict[str, Any] | None = None
-        try:
-            with path.open("r", encoding="utf-8") as stream:
-                for line in stream:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(record, dict) or record.get("event") != "request_start":
-                        continue
-                    request = record.get("request")
-                    if not isinstance(request, dict):
-                        continue
-                    if (
-                        media_item_count is not None
-                        and request.get("media_item_count") != media_item_count
-                    ):
-                        continue
-                    entry = record
-        except OSError:
-            return None
-        return entry
-
     def prepare(self, role: str, request: ProtocolRequest) -> RequestHandle:
-        order = len(self.handles)
-        self.progress(
-            "request.prepare",
-            role=role,
-            order=order,
-            protocol=request.protocol,
-            path=request.path,
-            stream=request.stream,
-        )
-        try:
-            prepared = self.client.prepare(request)
-        except Exception as error:
+        # A case may maintain background streaming loops while the main thread submits the
+        # workload under test. Serialize handle creation so roles retain one exact request order.
+        with self._handles_lock:
+            order = len(self.handles)
             self.progress(
-                "request.prepare_failed",
+                "request.prepare",
                 role=role,
                 order=order,
-                error=f"{type(error).__name__}: {error}",
+                protocol=request.protocol,
+                path=request.path,
+                stream=request.stream,
             )
-            raise
-        handle = RequestHandle(role, order, prepared, self._on_progress)
-        self.handles.append(handle)
+            try:
+                prepared = self.client.prepare(request)
+            except Exception as error:
+                self.progress(
+                    "request.prepare_failed",
+                    role=role,
+                    order=order,
+                    error=f"{type(error).__name__}: {error}",
+                )
+                raise
+            handle = RequestHandle(role, order, prepared, self._on_progress)
+            self.handles.append(handle)
         handle._progress(
             "request.prepared",
             protocol=request.protocol,
@@ -562,34 +612,47 @@ class CaseContext:
         )
         return handles
 
-    def require(self, condition: bool, expression: str, detail: str) -> None:
+    def require(
+        self, condition: bool, expression: str, detail: str, *, dimension: str = "construction"
+    ) -> None:
         if not condition:
-            self.failures.append(FailedCondition(expression, detail))
-            self.progress("case.condition_failed", expression=expression, detail=detail)
+            self.failures.append(FailedCondition(expression, detail, dimension))
+            self.progress("case.condition_failed", expression=expression, detail=detail, dimension=dimension)
 
-    def require_success(self, handle: RequestHandle) -> None:
+    def require_success(self, handle: RequestHandle, *, prerequisite: bool = True) -> None:
         handle.wait_completed(self.timeout)
         handle.wait_done(self.timeout)
         outcome = handle.outcome()
         if outcome != "success":
-            self.progress("case.prerequisite_failed", role=handle.role, outcome=outcome)
-            raise CaseExecutionError(f"prerequisite {handle.role} failed: {outcome}")
+            self.require(
+                False, f"{handle.role} completed successfully", outcome,
+                dimension="request_outcome",
+            )
+            if prerequisite:
+                self.progress("case.prerequisite_failed", role=handle.role, outcome=outcome)
+                raise CaseExecutionError(f"prerequisite {handle.role} failed: {outcome}")
 
     def wait_all(self, handles: Iterable[RequestHandle] | None = None) -> None:
-        selected = list(handles) if handles is not None else list(self.handles)
+        if handles is not None:
+            selected = list(handles)
+        else:
+            with self._handles_lock:
+                selected = list(self.handles)
         self.progress("case.wait_all", roles=[handle.role for handle in selected])
         for handle in selected:
             handle.wait_done(self.timeout)
         self.progress("case.wait_all_done", roles=[handle.role for handle in selected])
 
     def cancel_live(self) -> None:
-        live = [handle.role for handle in self.handles if not handle.is_done]
+        with self._handles_lock:
+            handles = list(self.handles)
+        live = [handle.role for handle in handles if not handle.is_done]
         if live:
             self.progress("case.cleanup_cancel", roles=live)
-        for handle in self.handles:
+        for handle in handles:
             if not handle.is_done:
                 handle.cancel()
-        for handle in self.handles:
+        for handle in handles:
             if not handle.is_done:
                 try:
                     handle.wait_done(min(self.timeout, 5.0))
@@ -604,4 +667,7 @@ class CaseContext:
                     )
 
     def records(self) -> list[dict[str, Any]]:
-        return [handle.as_record() for handle in sorted(self.handles, key=lambda item: item.order)]
+        with self._handles_lock:
+            handles = list(self.handles)
+        return [handle.as_record(freeze_input=True)
+                for handle in sorted(handles, key=lambda item: item.order)]

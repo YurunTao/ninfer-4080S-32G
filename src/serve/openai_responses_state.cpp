@@ -156,7 +156,8 @@ resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
         resolved.parent = parent_record->context;
     }
 
-    const bool parent_preserve = parent_record ? parent_record->preserve_thinking : false;
+    const std::optional<bool> parent_preserve =
+        parent_record ? parent_record->preserve_thinking : std::nullopt;
     if (resolved.generation.preserve_thinking) {
         resolved.preserve_thinking_semantic_change =
             parent_record && *resolved.generation.preserve_thinking != parent_preserve;
@@ -178,6 +179,7 @@ resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
     resolved.generation.messages.insert(resolved.generation.messages.end(),
                                         std::make_move_iterator(context.begin()),
                                         std::make_move_iterator(context.end()));
+    apply_openai_prompt_cache_policy(resolved.generation, request.cache_policy);
 
     if (response_id) {
         if (parent_record) {
@@ -185,9 +187,7 @@ resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
         } else if (store_response) {
             resolved.session_key = *response_id;
         }
-        resolved.cache_hints.session_key = resolved.session_key;
-        resolved.cache_hints.retention =
-            store_response ? CacheRetentionHint::LiveSession : CacheRetentionHint::Disposable;
+        resolved.cache_hints.session_key          = resolved.session_key;
         resolved.cache_hints.update_session_index = store_response;
     }
     return resolved;

@@ -16,6 +16,18 @@ bool is_ascii_whitespace(std::int32_t codepoint) noexcept {
 } // namespace
 
 std::string normalize_nfc(std::string_view text) {
+    // Every byte below 0x80 is a starter with combining class zero and takes part in no canonical
+    // composition, so pure ASCII is already in NFC and utf8proc has nothing to do with it. The
+    // scan is one pass the compiler vectorises against utf8proc's decode, map and recompose.
+    bool ascii_only = true;
+    for (const char byte : text) {
+        if (static_cast<unsigned char>(byte) >= 0x80u) {
+            ascii_only = false;
+            break;
+        }
+    }
+    if (ascii_only) { return std::string(text); }
+
     utf8proc_uint8_t* mapped = nullptr;
     const utf8proc_ssize_t result =
         utf8proc_map(reinterpret_cast<const utf8proc_uint8_t*>(text.data()),
@@ -35,6 +47,8 @@ CodepointSpan utf8_codepoint_at(std::string_view text, std::size_t offset,
     if (offset >= text.size()) {
         throw std::out_of_range("UTF-8 codepoint offset exceeds " + std::string(context));
     }
+    const auto first = static_cast<unsigned char>(text[offset]);
+    if (first < 0x80U) { return {first, offset, 1}; }
     utf8proc_int32_t codepoint = 0;
     const utf8proc_ssize_t length =
         utf8proc_iterate(reinterpret_cast<const utf8proc_uint8_t*>(text.data() + offset),
@@ -67,6 +81,9 @@ std::string codepoint_to_utf8(std::int32_t codepoint) {
 }
 
 bool is_letter(std::int32_t codepoint) noexcept {
+    if (static_cast<std::uint32_t>(codepoint) < 0x80U) {
+        return (codepoint >= 'A' && codepoint <= 'Z') || (codepoint >= 'a' && codepoint <= 'z');
+    }
     switch (utf8proc_category(codepoint)) {
     case UTF8PROC_CATEGORY_LU:
     case UTF8PROC_CATEGORY_LL:
@@ -80,6 +97,7 @@ bool is_letter(std::int32_t codepoint) noexcept {
 }
 
 bool is_mark(std::int32_t codepoint) noexcept {
+    if (static_cast<std::uint32_t>(codepoint) < 0x80U) { return false; }
     switch (utf8proc_category(codepoint)) {
     case UTF8PROC_CATEGORY_MN:
     case UTF8PROC_CATEGORY_MC:
@@ -91,6 +109,9 @@ bool is_mark(std::int32_t codepoint) noexcept {
 }
 
 bool is_number(std::int32_t codepoint) noexcept {
+    if (static_cast<std::uint32_t>(codepoint) < 0x80U) {
+        return codepoint >= '0' && codepoint <= '9';
+    }
     switch (utf8proc_category(codepoint)) {
     case UTF8PROC_CATEGORY_ND:
     case UTF8PROC_CATEGORY_NL:
@@ -102,7 +123,7 @@ bool is_number(std::int32_t codepoint) noexcept {
 }
 
 bool is_whitespace(std::int32_t codepoint) noexcept {
-    if (is_ascii_whitespace(codepoint)) { return true; }
+    if (static_cast<std::uint32_t>(codepoint) < 0x80U) { return is_ascii_whitespace(codepoint); }
     switch (utf8proc_category(codepoint)) {
     case UTF8PROC_CATEGORY_ZS:
     case UTF8PROC_CATEGORY_ZL:

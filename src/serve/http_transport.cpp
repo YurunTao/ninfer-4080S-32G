@@ -1,6 +1,7 @@
 #include "serve/http_transport.h"
 
 #include "serve/request_validation.h"
+#include "text/json_input.h"
 
 #if defined(__linux__)
 #    include <netinet/tcp.h>
@@ -27,15 +28,16 @@ void set_socket_option(socket_t socket, int level, int option, const T& value) n
 
 } // namespace
 
-nlohmann::json parse_json_body(const httplib::Request& request) {
+RequestJson parse_json_body(const httplib::Request& request) {
+    text::ParsedJsonNumbers parsed;
     try {
-        return nlohmann::json::parse(request.body);
+        parsed = text::parse_json_numbers(request.body);
     } catch (const std::exception&) { bad_request("request body is not valid JSON"); }
+    validate_schema_number_input(parsed);
+    return std::move(parsed.value);
 }
 
-bool client_disconnected(const httplib::Request& request) {
-    return request.is_connection_closed();
-}
+bool client_disconnected(const httplib::Request& request) { return request.is_connection_closed(); }
 
 void prepare_sse_response(httplib::Response& response) {
     response.set_header("Cache-Control", "no-cache");

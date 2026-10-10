@@ -1,7 +1,8 @@
+#include "core/weight.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 
 #include "ninfer_bench_common.h"
-#include "ops/dynamic_grouped_conv/w8/w8_dynamic_grouped_conv_add_plan.h"
+#include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.h"
 #include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
@@ -82,14 +83,17 @@ Options parse_args(int argc, char** argv) {
     return options;
 }
 
-void run_profile(std::int32_t input_rows, const Options& options, DeviceBuffer& flush,
+void run_profile(std::int32_t input_rows, const Options& options, bench::L2FlushBuffer& flush,
                  cudaStream_t stream) {
-    DeviceBuffer input = make_bf16(static_cast<std::size_t>(input_rows) * kMaximumWidth * 8);
-    DeviceBuffer base  = make_bf16(static_cast<std::size_t>(kHidden) * kTaps * kSides);
-    DeviceBuffer delta = make_bf16(static_cast<std::size_t>(kGroups) * kTaps * kMaximumWidth * 8);
-    DeviceBuffer residual        = make_bf16(static_cast<std::size_t>(kHidden) * kMaximumWidth * 8);
-    PackedQuantizedWeight packed = make_row_split_weight(QType::W8G32_F16S, kHidden, input_rows,
-                                                         input_rows, {0x31U, 0x00U, 0x1800U});
+    DeviceBuffer input = make_bf16(static_cast<std::size_t>(input_rows) * kMaximumWidth * 8, 101U);
+    DeviceBuffer base  = make_bf16(static_cast<std::size_t>(kHidden) * kTaps * kSides, 103U);
+    DeviceBuffer delta =
+        make_bf16(static_cast<std::size_t>(kGroups) * kTaps * kMaximumWidth * 8, 105U);
+    DeviceBuffer residual = make_bf16(static_cast<std::size_t>(kHidden) * kMaximumWidth * 8, 107U);
+    SavedBuffer residual_initial(residual);
+    const auto restore = [&](cudaStream_t s) { residual_initial.restore(s); };
+    PackedQuantizedWeight packed =
+        make_row_split_weight(QType::Q8_G32_FP16, kHidden, input_rows, input_rows, 501U);
     const std::size_t capacity =
         ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(input_rows, 2, 16, 1, 8);
     WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
@@ -114,15 +118,15 @@ void run_profile(std::int32_t input_rows, const Options& options, DeviceBuffer& 
                 workspace.reset();
                 workspace.reset_peak();
                 graph.capture(stream, launch);
-                const ColdTiming timing =
-                    measure_cold_graph(graph, flush, stream, options.warmup, options.repeat);
+                const ColdTiming timing = measure_cold_graph_prepared(
+                    restore, graph, flush, stream, options.warmup, options.repeat);
                 const double tflops    = flops / timing.median_us / 1.0e6;
                 const double bandwidth = bytes / timing.median_us / 1.0e3;
                 std::printf("%d,%d,%d,%d,%s,%.3f,%.3f,%.3f,%.2f,%.1f,%zu,%zu\n", input_rows, width,
                             batch_size, cols, route, timing.median_us, timing.min_us, timing.p95_us,
                             tflops, bandwidth, graph.nodes(), workspace.peak_used());
             };
-            const char* route = ops::detail::w8_linear_dynamic_grouped_conv_add_route_name(
+            const char* route = ops::detail::q8_linear_dynamic_grouped_conv_add_route_name(
                 input_rows, width, batch_size);
             measure(route, [&](cudaStream_t capture_stream) {
                 ops::linear_dynamic_grouped_conv_add(x, packed.weight, base_kernel, finish_delta,
@@ -142,7 +146,7 @@ int main(int argc, char** argv) {
     }
     try {
         const Options options = parse_args(argc, argv);
-        DeviceBuffer flush(options.flush_bytes);
+        bench::L2FlushBuffer flush(options.flush_bytes);
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         std::printf("C,W,B,T,route,median_us,min_us,p95_us,effective_tflops,effective_gbs,"

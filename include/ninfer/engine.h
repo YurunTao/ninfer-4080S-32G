@@ -72,7 +72,7 @@ public:
     [[nodiscard]] PreparedPrompt prepare(PromptInput input,
                                          const PreparationControl& control = {}) const;
 
-    // Raw token input is retained for parity tools and repeatable performance measurement.
+    // Raw token input is retained for repeatable correctness and performance measurement.
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
 
@@ -85,7 +85,6 @@ public:
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
-    [[nodiscard]] PromptCapabilities prompt_capabilities() const;
     [[nodiscard]] ModelSamplingDefaults sampling_defaults() const;
 
     // Establishes queue membership synchronously with a fixed output consumer mode. Destroying an

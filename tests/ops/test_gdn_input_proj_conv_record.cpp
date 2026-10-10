@@ -1,3 +1,4 @@
+#include "core/weight.h"
 #include "core/device.h"
 #include "ninfer/ops/gdn_input_proj.h"
 
@@ -22,6 +23,7 @@ namespace {
 
 constexpr std::int32_t kQueryRows = 2048;
 constexpr std::int32_t kKeyRows   = 2048;
+
 std::vector<std::uint16_t> make_bf16_bits(std::size_t elements, std::uint32_t seed, float low,
                                           float high) {
     std::vector<float> values(elements);
@@ -99,8 +101,8 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
     const std::vector<float> activation = make_bf16_activation(hidden, aggregate_columns, seed);
     const std::vector<std::uint16_t> conv_weight_bits =
         make_bf16_bits(static_cast<std::size_t>(channels) * 4, seed + 1, -0.02F, 0.02F);
-    const std::vector<std::uint16_t> state_before =
-        make_bf16_bits(static_cast<std::size_t>(channels) * 3 * source_slots, seed + 2, -0.05F, 0.05F);
+    const std::vector<std::uint16_t> state_before = make_bf16_bits(
+        static_cast<std::size_t>(channels) * 3 * source_slots, seed + 2, -0.05F, 0.05F);
 
     std::vector<std::uint16_t> snapshot_before(static_cast<std::size_t>(channels) * 3 * slots);
     std::copy(state_before.begin(), state_before.end(),
@@ -111,7 +113,8 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
     for (std::int32_t batch_row = 0; batch_row < batch; ++batch_row) {
         snapshot_bases[static_cast<std::size_t>(batch_row)] = batch_row * width;
         // Read-only selectors may repeat; source capacity does not depend on W.
-        initial_slots[static_cast<std::size_t>(batch_row)] = batch_row == 7 ? 7 : (batch_row * 3 + 7) % source_slots;
+        initial_slots[static_cast<std::size_t>(batch_row)] =
+            batch_row == 7 ? 7 : (batch_row * 3 + 7) % source_slots;
         snapshot_initial_slots[static_cast<std::size_t>(batch_row)] =
             aggregate_columns + initial_slots[static_cast<std::size_t>(batch_row)];
     }
@@ -122,9 +125,9 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
     DeviceBuffer record_state       = to_device(state_before);
     DeviceBuffer device_valid;
     if (!dense) { device_valid = to_device(valid_columns); }
-    DeviceBuffer device_initial  = to_device(initial_slots);
+    DeviceBuffer device_initial          = to_device(initial_slots);
     DeviceBuffer device_snapshot_initial = to_device(snapshot_initial_slots);
-    DeviceBuffer device_snapshot = to_device(snapshot_bases);
+    DeviceBuffer device_snapshot         = to_device(snapshot_bases);
 
     GuardedBf16Tensor snapshot_query(kQueryRows, aggregate_columns);
     GuardedBf16Tensor snapshot_key(kKeyRows, aggregate_columns);
@@ -162,14 +165,17 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
     cuda_synchronize();
     const auto launch = [&] {
         snapshot_launch(x, conv_weight, snapshot_state_view, valid, snapshot_initial, snapshot_base,
-                        snapshot_q, snapshot_k, snapshot_v, snapshot_z_view, snapshot_workspace, stream);
-        record_launch(x, conv_weight, record_state_view, valid, initial, conv_record_view,
-                      record_q, record_k, record_v, record_z_view, record_workspace, stream);
+                        snapshot_q, snapshot_k, snapshot_v, snapshot_z_view, snapshot_workspace,
+                        stream);
+        record_launch(x, conv_weight, record_state_view, valid, initial, conv_record_view, record_q,
+                      record_k, record_v, record_z_view, record_workspace, stream);
     };
     launch();
     CUDA_CHECK(cudaStreamSynchronize(stream));
     auto activation_bits = bf16_bits(activation);
-    if (width == 2 || width == 9 || width == 16) {
+    if (width == 2 || width == 9 || width == 10 || width == 16) {
+        // 2 is the bottom of the Q5 parent's split4 band, 9 the count that used to be its top, 10 the
+        // count that is its top now, and 16 a grouped representative extent.
         cudaGraph_t graph;
         cudaGraphExec_t executable;
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
@@ -181,7 +187,8 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
         // The same graph must consume changed inputs at the captured addresses.
         activation_bits = bf16_bits(make_bf16_activation(hidden, aggregate_columns, seed + 19));
         CUDA_CHECK(cudaMemcpyAsync(device_x.p, activation_bits.data(),
-            activation_bits.size() * sizeof(std::uint16_t), cudaMemcpyHostToDevice, stream));
+                                   activation_bits.size() * sizeof(std::uint16_t),
+                                   cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaGraphExecDestroy(executable));
@@ -213,9 +220,12 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
         verify_equal(std::string(label) + " source state", state_before, record_state_after);
 
     failures += verify_preserved(std::string(label) + " x", device_x, activation_bits);
-    failures += verify_preserved(std::string(label) + " conv weight", device_conv_weight, conv_weight_bits);
+    failures +=
+        verify_preserved(std::string(label) + " conv weight", device_conv_weight, conv_weight_bits);
     failures += verify_preserved(std::string(label) + " initial", device_initial, initial_slots);
-    if (!dense) { failures += verify_preserved(std::string(label) + " valid", device_valid, valid_columns); }
+    if (!dense) {
+        failures += verify_preserved(std::string(label) + " valid", device_valid, valid_columns);
+    }
     failures += snapshot_query.verify_guards(std::string(label) + " snapshot query");
     failures += snapshot_key.verify_guards(std::string(label) + " snapshot key");
     failures += snapshot_value.verify_guards(std::string(label) + " snapshot value");
@@ -248,9 +258,9 @@ int run_q4_q5() {
     constexpr std::int32_t kValueRows = 6144;
     constexpr std::int32_t kZRows     = 6144;
     DevicePackedWeight qk(
-        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, 4096, kHidden, 1401U));
+        quantized_weight::make_patterned_weight(QType::Q4_G64_FP16, 4096, kHidden, 1401U));
     DevicePackedWeight value_z(
-        quantized_weight::make_patterned_weight(QType::Q5G64_F16S, 12288, kHidden, 1403U));
+        quantized_weight::make_patterned_weight(QType::Q5_G64_FP16, 12288, kHidden, 1403U));
 
     int failures   = 0;
     const auto run = [&](std::int32_t width, std::int32_t batch, std::vector<std::int32_t> valid,
@@ -285,17 +295,23 @@ int run_q4_q5() {
     }
     failures += run(5, 3, {5, 3, 1}, 1491U);
     failures += run(4, 4, {4, 3, 2, 1}, 1492U);
+    // R7-review trial: the batched organisation whose aggregate column count is 8, which is inside the
+    // range the fused template covers when the request is read from the flattened token axis. The dense
+    // case checks the history reload at the request boundary, and the masked one additionally puts an
+    // invalid tail in the second request, so the boundary is checked next to a zeroed column.
+    failures += run(4, 2, {}, 1493U);
+    failures += run(4, 2, {4, 2}, 1494U);
     failures += qk.verify_preserved("Q4 record qk weight");
     failures += value_z.verify_preserved("Q5 record value/z weight");
     return failures;
 }
 
-int run_w8() {
+int run_q8() {
     constexpr std::int32_t kHidden    = 2048;
     constexpr std::int32_t kValueRows = 4096;
     constexpr std::int32_t kZRows     = 4096;
     DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::W8G32_F16S, 12288, kHidden, 1501U));
+        quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 12288, kHidden, 1501U));
 
     int failures   = 0;
     const auto run = [&](std::int32_t width, std::int32_t batch, std::vector<std::int32_t> valid,
@@ -306,7 +322,7 @@ int run_w8() {
         const std::size_t record_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
             kQueryRows, kKeyRows, kValueRows, batch, width, width);
         return run_case(
-            "W8 B=" + std::to_string(batch) + " T=" + std::to_string(width), kHidden, kValueRows,
+            "Q8 B=" + std::to_string(batch) + " T=" + std::to_string(width), kHidden, kValueRows,
             kZRows, width, batch, std::move(valid), snapshot_bytes, record_bytes,
             [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
                 const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
@@ -326,7 +342,7 @@ int run_w8() {
     failures += run(2, 1, {1}, 1511U);
     failures += run(16, 1, {}, 1521U);
     failures += run(16, 8, {16, 13, 9, 7, 5, 3, 2, 1}, 1531U);
-    failures += parent.verify_preserved("W8 record parent weight");
+    failures += parent.verify_preserved("Q8 record parent weight");
     return failures;
 }
 
@@ -370,54 +386,46 @@ int run_nvfp4() {
             },
             seed);
     };
-    failures += run(2, 1, {}, ops::LinearPolicy::A16Only, 1611U);
-    failures += run(16, 1, {11}, ops::LinearPolicy::A16Only, 1621U);
-    for (int width = 2; width <= 16; ++width) {
-        failures += run(width, 1, {}, ops::LinearPolicy::A16Only, 1600U + width);
-        failures += run(width, 8, ragged(width, 8), ops::LinearPolicy::A16Only, 1650U + width);
+    for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4}) {
+        for (int width = 2; width <= 16; ++width) {
+            failures += run(width, 1, {}, policy, 1600U + width);
+            failures += run(width, 8, ragged(width, 8), policy, 1650U + width);
+        }
     }
-#ifndef NINFER_SM86
-    failures += run(3, 1, {2}, ops::LinearPolicy::AllowA4, 1631U);
-    failures += run(4, 1, {}, ops::LinearPolicy::AllowA4, 1641U);
-    failures += run(16, 1, {13}, ops::LinearPolicy::AllowA4, 1651U);
-    failures += run(6, 3, {6, 4, 1}, ops::LinearPolicy::AllowA4, 1661U);
-    for (int width = 2; width <= 16; ++width) {
-        failures += run(width, 1, {}, ops::LinearPolicy::AllowA4, 1680U + width);
-        failures += run(width, 8, ragged(width, 8), ops::LinearPolicy::AllowA4, 1700U + width);
-    }
-#endif
     failures += parent.verify_preserved("NVFP4 record parent weight");
     return failures;
 }
 
 int run_fp8_case(DevicePackedWeight& parent, std::int32_t width, std::int32_t batch,
-                  std::vector<std::int32_t> valid, ops::LinearPolicy policy, std::uint32_t seed) {
+                 std::vector<std::int32_t> valid, ops::LinearPolicy policy, std::uint32_t seed) {
     const std::size_t snapshot_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16S, 16384, 5120, policy, batch, width, width);
+        QType::FP8_E4M3FN_ROW_BF16, 16384, 5120, policy, batch, width, width);
     const std::size_t record_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16S, 16384, 5120, policy, batch, width, width);
-    return run_case("FP8 policy=" + std::to_string(static_cast<int>(policy)) +
-                    " B=" + std::to_string(batch) + " W=" + std::to_string(width),
+        QType::FP8_E4M3FN_ROW_BF16, 16384, 5120, policy, batch, width, width);
+    return run_case(
+        "FP8 policy=" + std::to_string(static_cast<int>(policy)) + " B=" + std::to_string(batch) +
+            " W=" + std::to_string(width),
         5120, 6144, 6144, width, batch, std::move(valid), snapshot_bytes, record_bytes,
         [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
             const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
             Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
-            ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid_columns,
-                initial, snapshot_base, q, k, v, z, policy, workspace, stream);
+            ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid_columns, initial,
+                                              snapshot_base, q, k, v, z, policy, workspace, stream);
         },
         [&](const Tensor& x, const Tensor& conv, const Tensor& state, const Tensor& valid_columns,
-            const Tensor& initial, Tensor& record, Tensor& q, Tensor& k, Tensor& v,
-            Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
-            ops::gdn_input_proj_conv_record(x, parent.view(), conv, state, valid_columns,
-                initial, record, q, k, v, z, policy, workspace, stream);
-        }, seed);
+            const Tensor& initial, Tensor& record, Tensor& q, Tensor& k, Tensor& v, Tensor& z,
+            WorkspaceArena& workspace, cudaStream_t stream) {
+            ops::gdn_input_proj_conv_record(x, parent.view(), conv, state, valid_columns, initial,
+                                            record, q, k, v, z, policy, workspace, stream);
+        },
+        seed);
 }
 
 int run_fp8() {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kRows   = 16384;
-    DevicePackedWeight parent(quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S,
-                                                                      kRows, kHidden, 1701U));
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, 1701U));
     int failures = 0;
     for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}) {
         for (int width = 2; width <= 16; ++width) {
@@ -442,7 +450,7 @@ int main() {
 
     int failures = 0;
     failures += run_q4_q5();
-    failures += run_w8();
+    failures += run_q8();
     failures += run_nvfp4();
     failures += run_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record\n";

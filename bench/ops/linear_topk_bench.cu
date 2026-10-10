@@ -1,4 +1,5 @@
 // Public cold-cache benchmark for the three registered linear_topk profiles.
+#include "core/weight.h"
 #include "ninfer/ops/linear_topk.h"
 
 #include "ninfer_bench_common.h"
@@ -23,46 +24,13 @@ using namespace ninfer::bench;
 namespace {
 
 enum class Profile {
-    W8,
+    Q8,
     Fp8,
     Q4,
 };
 
-__device__ unsigned pattern(unsigned x) {
-    x ^= x >> 16;
-    x *= 0x7feb352du;
-    x ^= x >> 15;
-    x *= 0x846ca68bu;
-    return x ^ (x >> 16);
-}
-
-__global__ void varied_codes(std::uint8_t* codes, std::uint64_t count, Profile profile) {
-    const auto stride = std::uint64_t(gridDim.x) * blockDim.x;
-    for (auto i = std::uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += stride) {
-        const unsigned bits = pattern(static_cast<unsigned>(i) ^ 0x8351729bu);
-        if (profile == Profile::Q4) {
-            const int a = static_cast<int>(bits % 15) - 7;
-            const int b = static_cast<int>((bits >> 8) % 15) - 7;
-            codes[i]    = (a & 15) | ((b & 15) << 4);
-        } else if (profile == Profile::Fp8) {
-            codes[i] = (bits % 127) | ((bits >> 24) & 128);
-        } else {
-            codes[i] = static_cast<std::uint8_t>(static_cast<int>(bits % 255) - 127);
-        }
-    }
-}
-
-__global__ void varied_scales(std::uint16_t* scales, std::uint64_t count, bool bf16) {
-    const auto stride = std::uint64_t(gridDim.x) * blockDim.x;
-    for (auto i = std::uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += stride) {
-        const float value = 0.002f * (1 + pattern(static_cast<unsigned>(i) ^ 0x91f237u) % 31);
-        scales[i]         = bf16 ? __bfloat16_as_ushort(__float2bfloat16_rn(value))
-                                 : __half_as_ushort(__float2half_rn(value));
-    }
-}
-
 const char* profile_name(Profile profile) {
-    if (profile == Profile::W8) { return "w8-full"; }
+    if (profile == Profile::Q8) { return "q8-full"; }
     if (profile == Profile::Fp8) { return "fp8-full"; }
     return "q4-optimized";
 }
@@ -71,25 +39,14 @@ void run(Profile profile, std::int32_t columns, int warmup, int repeat) {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kTopK   = 16;
     const std::int32_t rows        = profile == Profile::Q4 ? 131072 : 248320;
-    const QType qtype              = profile == Profile::W8    ? QType::W8G32_F16S
-                                     : profile == Profile::Fp8 ? QType::FP8_E4M3FN_ROW_BF16S
-                                                               : QType::Q4G64_F16S;
+    const QType qtype              = profile == Profile::Q8    ? QType::Q8_G32_FP16
+                                     : profile == Profile::Fp8 ? QType::FP8_E4M3FN_ROW_BF16
+                                                               : QType::Q4_G64_FP16;
 
-    PackedQuantizedWeight packed =
-        profile == Profile::Fp8
-            ? make_fp8_weight(rows, kHidden)
-            : make_row_split_weight(qtype, rows, kHidden, kHidden,
-                                    QuantizedWeightFill{profile == Profile::Q4 ? std::uint8_t{0x11}
-                                                                               : std::uint8_t{0x01},
-                                                        0, 0x3c00});
-    varied_codes<<<4096, 256>>>(static_cast<std::uint8_t*>(packed.storage.p), packed.low_bytes,
-                                profile);
-    varied_scales<<<1024, 256>>>(
-        reinterpret_cast<std::uint16_t*>(static_cast<std::uint8_t*>(packed.storage.p) +
-                                         packed.scale_offset),
-        packed.scale_bytes / 2, profile == Profile::Fp8);
-    CUDA_CHECK(cudaGetLastError());
-    DeviceBuffer hidden = make_bf16(static_cast<std::size_t>(kHidden) * columns);
+    PackedQuantizedWeight packed = profile == Profile::Fp8
+                                       ? make_fp8_weight(rows, kHidden)
+                                       : make_row_split_weight(qtype, rows, kHidden, kHidden, 501U);
+    DeviceBuffer hidden          = make_bf16(static_cast<std::size_t>(kHidden) * columns, 101U);
     DeviceBuffer ids(static_cast<std::size_t>(kTopK) * columns * sizeof(std::int32_t));
     DeviceBuffer scores(static_cast<std::size_t>(kTopK) * columns * sizeof(float));
     DeviceBuffer id_map(
@@ -107,7 +64,7 @@ void run(Profile profile, std::int32_t columns, int warmup, int repeat) {
     Tensor ids_tensor(ids.p, DType::I32, {kTopK, columns});
     Tensor scores_tensor(scores.p, DType::FP32, {kTopK, columns});
     Tensor map_tensor(id_map.p, DType::I32, {rows});
-    DeviceBuffer flush(256ULL << 20);
+    bench::L2FlushBuffer flush(256ULL << 20);
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
@@ -135,10 +92,10 @@ void run(Profile profile, std::int32_t columns, int warmup, int repeat) {
 }
 
 Profile parse_profile(std::string_view value) {
-    if (value == "w8-full") { return Profile::W8; }
+    if (value == "q8-full") { return Profile::Q8; }
     if (value == "fp8-full") { return Profile::Fp8; }
     if (value == "q4-optimized") { return Profile::Q4; }
-    throw std::invalid_argument("profile must be w8-full, fp8-full, or q4-optimized");
+    throw std::invalid_argument("profile must be q8-full, fp8-full, or q4-optimized");
 }
 
 } // namespace
@@ -157,7 +114,7 @@ int main(int argc, char** argv) {
             const std::string flag = argv[i];
             if (flag == "--help") {
                 std::printf(
-                    "usage: %s [--profile all|w8-full|fp8-full|q4-optimized] [--columns U,...] "
+                    "usage: %s [--profile all|q8-full|fp8-full|q4-optimized] [--columns U,...] "
                     "[--warmup N] [--repeat N]\n",
                     argv[0]);
                 return 0;
@@ -187,7 +144,7 @@ int main(int argc, char** argv) {
         if (warmup < 0 || repeat < 1) throw std::invalid_argument("invalid timing counts");
         std::vector<Profile> profiles;
         if (profile == "all")
-            profiles = {Profile::W8, Profile::Fp8, Profile::Q4};
+            profiles = {Profile::Q8, Profile::Fp8, Profile::Q4};
         else
             profiles = {parse_profile(profile)};
         std::puts(

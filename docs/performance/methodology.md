@@ -9,17 +9,17 @@ performance.
 
 ## Common serving profile
 
-The published runs use the following common settings. Model-page run records specify context,
-concurrency, KV capacity, driver API version, sampling exceptions, and artifact paths.
+The published runs use the following settings. Model-page run records specify context,
+concurrency, KV representation and capacity, toolchain, sampling exceptions, and artifact paths.
 These are recorded experimental settings, not promises about current executable defaults.
 
 | Setting | Value |
 |---|---|
 | GPU | One NVIDIA GeForce RTX 5090, 32 GiB |
-| CUDA compile/runtime | 13.1 / 13.1 |
+| CUDA compile/runtime | Qwen3.8: 13.4 / 13.4; Qwen3.6: 13.1 / 13.1 |
 | Route | Persistent `ninfer-serve`, loopback OpenAI Chat Completions, `stream=false` |
 | Prefill chunk | 1,024 tokens |
-| KV cache | INT8 group-64 |
+| KV cache | Qwen3.8: FP8 E4M3 row-256; Qwen3.6: INT8 group-64 |
 | CUDA Graph | Enabled |
 | Prefix reuse | Disabled |
 | Stochastic sampling | Temperature 0.6, top-p 0.95, top-k 20, min-p 0, presence penalty 1.0, frequency penalty 0 |
@@ -77,9 +77,11 @@ response. Each request has a 16,384-token context ceiling; the measured automati
 
 Steady throughput includes only complete one-second server intervals with zero computed prefill
 tokens, `running=C`, `prefilling=0`, `decode_ready=C`, at least one decode round, and exactly C rows
-in every round. Ramp-up, prefill, and drain are excluded. Wave makespan still spans client release
-through the last complete response. Acceptance is aggregated over the full wave, not just steady
-intervals. Each published point is one wave, not a repeated-sample mean.
+in every round. Intervals must have no preemptions, Snapshot/Replay restores or replayed tokens,
+and no paused or replaying requests at the end. Ramp-up, prefill, recovery, and drain are excluded.
+Wave makespan still spans client release through the last complete response. Acceptance is
+aggregated over the full wave, not just steady intervals. Each published point is one wave,
+not a repeated-sample mean.
 
 ## Metrics and statistics
 

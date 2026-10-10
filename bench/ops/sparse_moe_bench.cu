@@ -4,6 +4,7 @@
 // private plans, or kernel candidates. Production dispatch remains entirely
 // behind ninfer::ops::sparse_moe().
 
+#include "core/weight.h"
 #include "ninfer/ops/sparse_moe.h"
 
 #include "core/device.h"
@@ -44,7 +45,7 @@ constexpr std::uint64_t kDefaultFlushBytes = 256ULL << 20;
 enum class CodecProfile : std::uint8_t {
     Q4Q5,
     Q4Q6,
-    W8W8,
+    Q8Q8,
 };
 
 enum class ExpertDistribution : std::uint8_t {
@@ -120,24 +121,24 @@ const char* codec_name(CodecProfile profile) {
         return "q4-q5";
     case CodecProfile::Q4Q6:
         return "q4-q6";
-    case CodecProfile::W8W8:
-        return "w8-w8";
+    case CodecProfile::Q8Q8:
+        return "q8-q8";
     }
     return "unknown";
 }
 
 QType gate_codec(CodecProfile profile) {
-    return profile == CodecProfile::W8W8 ? QType::W8G32_F16S : QType::Q4G64_F16S;
+    return profile == CodecProfile::Q8Q8 ? QType::Q8_G32_FP16 : QType::Q4_G64_FP16;
 }
 
 QType down_codec(CodecProfile profile) {
     switch (profile) {
     case CodecProfile::Q4Q5:
-        return QType::Q5G64_F16S;
+        return QType::Q5_G64_FP16;
     case CodecProfile::Q4Q6:
-        return QType::Q6G64_F16S;
-    case CodecProfile::W8W8:
-        return QType::W8G32_F16S;
+        return QType::Q6_G64_FP16;
+    case CodecProfile::Q8Q8:
+        return QType::Q8_G32_FP16;
     }
     throw std::logic_error("unknown SparseMoe codec profile");
 }
@@ -169,21 +170,21 @@ const char* execution_name(Execution execution) {
 const char* cache_name(CacheState cache) { return cache == CacheState::Cold ? "cold" : "warm"; }
 
 std::uint64_t packed_weight_bytes(QType qtype, std::int32_t rows, std::int32_t columns) {
-    const std::int32_t group   = qtype == QType::W8G32_F16S ? 32 : 64;
+    const std::int32_t group   = qtype == QType::Q8_G32_FP16 ? 32 : 64;
     const std::uint64_t groups = static_cast<std::uint64_t>(rows) * columns / group;
-    const std::uint64_t low    = qtype == QType::W8G32_F16S
+    const std::uint64_t low    = qtype == QType::Q8_G32_FP16
                                      ? static_cast<std::uint64_t>(rows) * columns
                                      : static_cast<std::uint64_t>(rows) * columns / 2;
-    const std::uint64_t high   = qtype == QType::Q5G64_F16S   ? groups * 8
-                                 : qtype == QType::Q6G64_F16S ? groups * 16
-                                                              : 0;
+    const std::uint64_t high   = qtype == QType::Q5_G64_FP16   ? groups * 8
+                                 : qtype == QType::Q6_G64_FP16 ? groups * 16
+                                                               : 0;
     return low + high + groups * sizeof(std::uint16_t);
 }
 
 double unique_weight_bytes(const Result& result) {
     const std::uint64_t fixed = static_cast<std::uint64_t>(kRouterRows) * kHidden * 2 +
-                                packed_weight_bytes(QType::W8G32_F16S, 1024, kHidden) +
-                                packed_weight_bytes(QType::W8G32_F16S, kHidden, kIntermediate);
+                                packed_weight_bytes(QType::Q8_G32_FP16, 1024, kHidden) +
+                                packed_weight_bytes(QType::Q8_G32_FP16, kHidden, kIntermediate);
     const std::uint64_t per_expert =
         packed_weight_bytes(gate_codec(result.codec), 1024, kHidden) +
         packed_weight_bytes(down_codec(result.codec), kHidden, kIntermediate);
@@ -285,7 +286,7 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "Usage: %s [options]\n\n"
                  "Public workload:\n"
-                 "  --codec q4-q5|q4-q6|w8-w8|all  Routed weight profile (default q4-q5).\n"
+                 "  --codec q4-q5|q4-q6|q8-q8|all  Routed weight profile (default q4-q5).\n"
                  "  --tokens T                       Exact token extent (default 1).\n"
                  "  --sweep START:END[:STEP]         Public token-extent sweep.\n"
                  "  --distribution trace-like|independent|same\n"
@@ -354,9 +355,9 @@ Options parse_options(int argc, char** argv) {
     if (have_tokens && have_sweep) {
         throw std::invalid_argument("--tokens and --sweep are mutually exclusive");
     }
-    if (options.codec != "q4-q5" && options.codec != "q4-q6" && options.codec != "w8-w8" &&
+    if (options.codec != "q4-q5" && options.codec != "q4-q6" && options.codec != "q8-q8" &&
         options.codec != "all") {
-        throw std::invalid_argument("--codec must be q4-q5, q4-q6, w8-w8, or all");
+        throw std::invalid_argument("--codec must be q4-q5, q4-q6, q8-q8, or all");
     }
     if (options.repeat <= 0) { throw std::invalid_argument("--repeat must be positive"); }
     if (options.flush_bytes > std::numeric_limits<std::size_t>::max()) {
@@ -366,10 +367,10 @@ Options parse_options(int argc, char** argv) {
 }
 
 std::vector<CodecProfile> selected_profiles(const std::string& codec) {
-    if (codec == "all") { return {CodecProfile::Q4Q5, CodecProfile::Q4Q6, CodecProfile::W8W8}; }
+    if (codec == "all") { return {CodecProfile::Q4Q5, CodecProfile::Q4Q6, CodecProfile::Q8Q8}; }
     if (codec == "q4-q5") return {CodecProfile::Q4Q5};
     if (codec == "q4-q6") return {CodecProfile::Q4Q6};
-    return {CodecProfile::W8W8};
+    return {CodecProfile::Q8Q8};
 }
 
 std::vector<std::int32_t> selected_tokens(const TokenSweep& sweep) {
@@ -487,7 +488,7 @@ Weight dense_weight(void* data, std::int32_t rows, std::int32_t columns) {
     Weight result{};
     result.payload         = data;
     result.payload_bytes   = static_cast<std::uint64_t>(rows) * columns * 2ULL;
-    result.qtype           = QType::BF16_CTRL;
+    result.qtype           = QType::BF16;
     result.qdata           = data;
     result.n               = rows;
     result.k               = columns;
@@ -504,16 +505,14 @@ class BenchmarkWeights {
 public:
     BenchmarkWeights(CodecProfile profile, std::uint32_t seed, std::size_t flush_bytes)
         : router_(static_cast<std::size_t>(kRouterRows) * kHidden * 2),
-          routed_gate_(bench::make_row_split_weight(
-              gate_codec(profile), kExperts * 1024, kHidden, kHidden,
-              {static_cast<std::uint8_t>(0x31U ^ seed), 0xa5, 0x1401})),
-          routed_down_(bench::make_row_split_weight(
-              down_codec(profile), kExperts * kHidden, kIntermediate, kIntermediate,
-              {static_cast<std::uint8_t>(0x59U ^ (seed >> 8)), 0x6d, 0x1403})),
-          shared_gate_(bench::make_row_split_weight(QType::W8G32_F16S, 1024, kHidden, kHidden,
-                                                    {0x27, 0x00, 0x1405})),
-          shared_down_(bench::make_row_split_weight(QType::W8G32_F16S, kHidden, kIntermediate,
-                                                    kIntermediate, {0x73, 0x00, 0x1407})),
+          routed_gate_(bench::make_row_split_weight(gate_codec(profile), kExperts * 1024, kHidden,
+                                                    kHidden, seed ^ 501U)),
+          routed_down_(bench::make_row_split_weight(down_codec(profile), kExperts * kHidden,
+                                                    kIntermediate, kIntermediate, seed ^ 503U)),
+          shared_gate_(bench::make_row_split_weight(QType::Q8_G32_FP16, 1024, kHidden, kHidden,
+                                                    seed ^ 505U)),
+          shared_down_(bench::make_row_split_weight(QType::Q8_G32_FP16, kHidden, kIntermediate,
+                                                    kIntermediate, seed ^ 507U)),
           flush_(flush_bytes) {
         std::vector<std::uint16_t> router(static_cast<std::size_t>(kRouterRows) * kHidden,
                                           bench::f32_to_bf16(0.0F));
@@ -522,7 +521,7 @@ public:
         }
         router[static_cast<std::size_t>(kExperts) * kHidden + kExperts] = bench::f32_to_bf16(4.0F);
         router_.copy_from_host(router.data(), router_.bytes);
-        CUDA_CHECK(cudaMemset(flush_.p, 0xa5, flush_.bytes));
+        bench::flush_l2(flush_, nullptr);
 
         weights_ = {
             dense_weight(router_.p, kRouterRows, kHidden),
@@ -536,9 +535,7 @@ public:
 
     [[nodiscard]] const ops::SparseMoeWeights& weights() const noexcept { return weights_; }
 
-    void flush(cudaStream_t stream) {
-        CUDA_CHECK(cudaMemsetAsync(flush_.p, 0xa5, flush_.bytes, stream));
-    }
+    void flush(cudaStream_t stream) { bench::flush_l2(flush_, stream); }
 
 private:
     DeviceBuffer router_;
@@ -546,15 +543,17 @@ private:
     bench::PackedQuantizedWeight routed_down_;
     bench::PackedQuantizedWeight shared_gate_;
     bench::PackedQuantizedWeight shared_down_;
-    DeviceBuffer flush_;
+    bench::L2FlushBuffer flush_;
     ops::SparseMoeWeights weights_{};
 };
 
 class BenchmarkState {
 public:
     BenchmarkState(BenchmarkWeights& fixture, CodecProfile profile, std::int32_t tokens,
-                   ExpertDistribution distribution, std::uint32_t seed)
-        : fixture_(fixture), route_pattern_(make_route_pattern(tokens, distribution, seed)),
+                   ExpertDistribution distribution, std::uint32_t seed,
+                   DeviceExecutionView execution)
+        : fixture_(fixture), execution_(execution),
+          route_pattern_(make_route_pattern(tokens, distribution, seed)),
           input_(static_cast<std::size_t>(tokens) * kHidden * 2),
           residual_(static_cast<std::size_t>(tokens) * kHidden * 2),
           destination_(static_cast<std::size_t>(tokens) * kHidden * 2),
@@ -565,11 +564,11 @@ public:
         std::vector<std::uint16_t> residual(static_cast<std::size_t>(tokens) * kHidden);
         for (std::int32_t token = 0; token < tokens; ++token) {
             for (std::int32_t index = 0; index < kHidden; ++index) {
-                const std::int32_t centered = (index * 17 + token * 29 + (index ^ token)) % 81 - 40;
-                input[static_cast<std::size_t>(token) * kHidden + index] =
-                    bench::f32_to_bf16(static_cast<float>(centered) * 0.001F);
-                residual[static_cast<std::size_t>(token) * kHidden + index] = bench::f32_to_bf16(
-                    0.125F + static_cast<float>((index + 11 * token) % 17) * 0.002F);
+                const auto offset = static_cast<std::size_t>(token) * kHidden + index;
+                input[offset] =
+                    bench::f32_to_bf16(bench::fixture::uniform(offset, seed ^ 101U, -.04F, .04F));
+                residual[offset] =
+                    bench::f32_to_bf16(bench::fixture::uniform(offset, seed ^ 103U, -.2F, .2F));
             }
             for (std::int32_t expert = 0; expert < kExperts; ++expert) {
                 input[static_cast<std::size_t>(token) * kHidden + expert] =
@@ -605,11 +604,12 @@ public:
 
     void launch(cudaStream_t stream) {
         ops::sparse_moe(x_, fixture_.weights(), ops::SparseMoeEpilogue::AddResidual,
-                        destination_tensor_, workspace_, stream);
+                        destination_tensor_, workspace_, execution_.on_stream(stream));
     }
 
 private:
     BenchmarkWeights& fixture_;
+    DeviceExecutionView execution_;
     RoutePattern route_pattern_;
     DeviceBuffer input_;
     DeviceBuffer residual_;
@@ -730,8 +730,10 @@ Stats measure_graph(BenchmarkState& state, const BodyTimedGraph& graph, CacheSta
 }
 
 std::vector<Result> run_point(BenchmarkWeights& fixture, CodecProfile profile, std::int32_t tokens,
-                              const Options& options, cudaStream_t stream) {
-    BenchmarkState state(fixture, profile, tokens, options.distribution, options.seed);
+                              const Options& options, DeviceExecutionView device_execution) {
+    const cudaStream_t stream = device_execution.stream;
+    BenchmarkState state(fixture, profile, tokens, options.distribution, options.seed,
+                         device_execution);
 
     // Match the production graph lifecycle: materialize eagerly, capture from a
     // reset state, instantiate, then prime one replay before configured warmup.
@@ -839,7 +841,7 @@ int main(int argc, char** argv) {
                                      static_cast<std::size_t>(options.flush_bytes));
             for (std::int32_t tokens : selected_tokens(options.tokens)) {
                 std::vector<Result> point =
-                    run_point(fixture, profile, tokens, options, context.stream);
+                    run_point(fixture, profile, tokens, options, context.execution_view());
                 for (const Result& result : point) { print_result(result, peak_memory_gbps); }
                 results.insert(results.end(), std::make_move_iterator(point.begin()),
                                std::make_move_iterator(point.end()));

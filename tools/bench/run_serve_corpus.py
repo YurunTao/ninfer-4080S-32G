@@ -16,26 +16,27 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Iterable, Sequence
+from urllib.parse import quote
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = REPO_ROOT / "examples/cli/manifest.json"
 
-TARGET_MODEL_IDS = {
-    "qwen3_6_35b_a3b": "qwen3.6-35b-a3b",
-    "qwen3_6_27b": "qwen3.6-27b",
-    "qwen3_8_27b": "qwen3.8-27b",
-}
-TARGET_ORDER = tuple(TARGET_MODEL_IDS)
 SPECULATIVE_MODES = {
     "mtp0": ("none", 0),
-    "mtp2": ("mtp", 2),
     "mtp3": ("mtp", 3),
     "dflash7": ("dflash", 7),
     "dflash2_7": ("dflash2", 7),
 }
 DEFAULT_MODES = ("mtp0", "mtp3")
 SAMPLING_MODES = ("stochastic", "greedy")
+KV_CACHE_NAMES = {
+    "bf16": "bf16",
+    "int8": "int8-group64",
+    "fp8": "fp8-e4m3-row256",
+    "nvfp4": "nvfp4",
+    "k8v4": "k8v4",
+}
 
 SEEDS = (
     7632647173703958409,
@@ -83,9 +84,9 @@ SCENARIO_FIXTURES = {
 
 WARMUP_FIXTURE = "text_smoke_zh"
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
-RUN_SCHEMA_VERSION = 6
+RUN_SCHEMA_VERSION = 8
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
-SERVER_LOG_SCHEMA_VERSION = 18
+SERVER_LOG_SCHEMA_VERSION = 24
 STARTUP_TIMEOUT_SECONDS = 1800.0
 REQUEST_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
 LOG_EVENT_TIMEOUT_SECONDS = 10.0
@@ -110,6 +111,7 @@ class RunSpec:
     speculative_backend: str
     draft_tokens: int
     sampling_mode: str
+    kv_dtype: str
     fixture: Fixture
     seed: int
 
@@ -280,8 +282,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--artifact",
         action="append",
         required=True,
-        metavar="TARGET=PATH",
-        help="artifact for a registered target; repeat to benchmark multiple targets",
+        metavar="LABEL=PATH",
+        help="artifact label and server model alias; repeat to benchmark multiple instances",
     )
     parser.add_argument(
         "--mode",
@@ -298,7 +300,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True, help="campaign output directory")
     parser.add_argument("--port", type=int, default=8080, help="loopback serving port")
     parser.add_argument("--device", type=int, default=0, help="CUDA device index")
+    parser.add_argument("--kv-dtype", choices=tuple(KV_CACHE_NAMES), default="int8")
     return parser.parse_args(argv)
+
+
+def filename_label(label: str) -> str:
+    """Keep arbitrary public aliases distinct inside one report filename component."""
+    return quote(label, safe="")
 
 
 def parse_artifacts(values: Sequence[str]) -> list[tuple[str, Path]]:
@@ -306,17 +314,16 @@ def parse_artifacts(values: Sequence[str]) -> list[tuple[str, Path]]:
     for value in values:
         target, separator, raw_path = value.partition("=")
         if not separator or not target or not raw_path:
-            raise CampaignError(f"invalid --artifact value {value!r}; expected TARGET=PATH")
-        if target not in TARGET_MODEL_IDS:
-            expected = ", ".join(TARGET_MODEL_IDS)
-            raise CampaignError(f"unsupported artifact target {target!r}; expected {expected}")
+            raise CampaignError(f"invalid --artifact value {value!r}; expected LABEL=PATH")
+        if not target.strip():
+            raise CampaignError("artifact label must not be empty")
         if target in parsed:
-            raise CampaignError(f"duplicate artifact target: {target}")
+            raise CampaignError(f"duplicate artifact label: {target}")
         path = Path(raw_path).expanduser().resolve()
         if not path.is_file():
             raise CampaignError(f"artifact not found: {path}")
         parsed[target] = path
-    return [(target, parsed[target]) for target in TARGET_ORDER if target in parsed]
+    return list(parsed.items())
 
 
 def fixture_metadata(name: str) -> tuple[str, str | None]:
@@ -378,26 +385,24 @@ def build_specs(
     fixtures: dict[str, Fixture],
     mode_names: Sequence[str],
     sampling_mode: str,
+    kv_dtype: str,
 ) -> list[RunSpec]:
     specs: list[RunSpec] = []
     for target, artifact in artifacts:
         for mode_name in mode_names:
             backend, draft_tokens = SPECULATIVE_MODES[mode_name]
-            if backend == "dflash" and target != "qwen3_6_35b_a3b":
-                raise CampaignError("DFlash corpus measurements require the 35B-A3B target")
-            if backend == "dflash2" and target != "qwen3_8_27b":
-                raise CampaignError("DFlash2 corpus measurements require Qwen3.8-27B")
             for fixture_name in block_fixture_names(backend):
                 for seed in SEEDS:
                     specs.append(
                         RunSpec(
                             target=target,
-                            model_id=TARGET_MODEL_IDS[target],
+                            model_id=target,
                             artifact=artifact,
                             speculative_mode=mode_name,
                             speculative_backend=backend,
                             draft_tokens=draft_tokens,
                             sampling_mode=sampling_mode,
+                            kv_dtype=kv_dtype,
                             fixture=fixtures[fixture_name],
                             seed=seed,
                         )
@@ -488,7 +493,7 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
         "max_context": 262144,
         "kv_capacity": 262144,
         "prefill_chunk": 1024,
-        "kv_cache": "int8-group64",
+        "kv_cache": KV_CACHE_NAMES[spec.kv_dtype],
         "cuda_graph": True,
         "prefix_reuse": False,
         "speculative_backend": spec.speculative_backend,
@@ -497,24 +502,27 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
     }
     if actual != expected:
         raise CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
+    context_cache = engine.get("context_cache", {})
+    if (
+        context_cache.get("device_state_slots") != 0
+        or context_cache.get("host_capacity_bytes") != 0
+    ):
+        raise CampaignError("server_start context cache capacity differs from the campaign")
     if event.get("sampling_defaults", {}).get("greedy") != (
         spec.sampling_mode == "greedy"
     ):
         raise CampaignError("server_start sampling mode does not match the campaign")
-    if event.get("artifact", {}).get("target") != spec.target:
-        raise CampaignError(
-            "loaded artifact target mismatch: "
-            f"{event.get('artifact', {}).get('target')!r} != {spec.target!r}"
-        )
-    weights_id = event.get("artifact", {}).get("weights_id")
-    if not isinstance(weights_id, str) or not weights_id:
-        raise CampaignError("server_start has no canonical artifact weights_id")
+    if Path(event.get("artifact", {}).get("path", "")).resolve() != spec.artifact.resolve():
+        raise CampaignError("loaded artifact path does not match the campaign")
+    prefill_signature = event.get("artifact", {}).get("prefill_signature")
+    if not isinstance(prefill_signature, str) or not prefill_signature:
+        raise CampaignError("server_start has no canonical artifact prefill_signature")
     if event.get("server", {}).get("public_model_id") != spec.model_id:
         raise CampaignError("server_start public model id does not match the campaign target")
     server_instance_id = event.get("server_instance_id")
     if not isinstance(server_instance_id, str) or not server_instance_id:
         raise CampaignError("server_start has no server_instance_id")
-    return server_instance_id, weights_id
+    return server_instance_id, prefill_signature
 
 
 def safe_ratio(numerator: float, denominator: float) -> float | None:
@@ -525,7 +533,7 @@ def safe_ratio(numerator: float, denominator: float) -> float | None:
 
 def build_result_record(
     spec: RunSpec,
-    weights_id: str,
+    prefill_signature: str,
     payload: dict[str, Any],
     response: dict[str, Any],
     server_event: dict[str, Any],
@@ -658,7 +666,7 @@ def build_result_record(
         "artifact_type": RUN_ARTIFACT_TYPE,
         "schema_version": RUN_SCHEMA_VERSION,
         "target": spec.target,
-        "weights_id": weights_id,
+        "prefill_signature": prefill_signature,
         "model": spec.model_id,
         "artifact_path": str(spec.artifact),
         "fixture": spec.fixture.name,
@@ -669,6 +677,7 @@ def build_result_record(
         "speculative_backend": spec.speculative_backend,
         "draft_tokens": spec.draft_tokens,
         "sampling_mode": spec.sampling_mode,
+        "kv_dtype": spec.kv_dtype,
         "request": payload,
         "response": response,
         "server_event": server_event,
@@ -714,6 +723,10 @@ def load_existing_records(
                 if key in records:
                     raise CampaignError(f"{path}:{line_number}: duplicate result for {key!r}")
                 spec = expected_specs[key]
+                if record.get("kv_dtype") != spec.kv_dtype:
+                    raise CampaignError(
+                        f"{path}:{line_number}: KV dtype differs from the current command"
+                    )
                 if Path(record.get("artifact_path", "")).resolve() != spec.artifact:
                     raise CampaignError(
                         f"{path}:{line_number}: artifact path differs from the current command"
@@ -748,6 +761,8 @@ def server_command(
         spec.model_id,
         "--max-context",
         "262144",
+        "--kv-capacity",
+        "262144",
         "--prefill-chunk",
         "1024",
         "--log-stats-interval-ms",
@@ -757,8 +772,12 @@ def server_command(
         "--request-log-jsonl",
         str(server_log),
         "--kv-dtype",
-        "int8",
+        spec.kv_dtype,
         "--no-prefix-reuse",
+        "--device-state-slots",
+        "0",
+        "--host-context-mib",
+        "0",
     ]
     if spec.speculative_backend != "none":
         command.extend(
@@ -810,7 +829,7 @@ def run_block(
     server_log = (
         output_dir
         / "server"
-        / f"{first.target}_{first.speculative_mode}_{first.sampling_mode}.jsonl"
+        / f"{filename_label(first.target)}_{first.kv_dtype}_{first.speculative_mode}_{first.sampling_mode}.jsonl"
     )
     command = server_command(serve, first, server_log, port, device)
     print(
@@ -820,7 +839,7 @@ def run_block(
     )
     with RunningServer(command, "127.0.0.1", port, server_log) as server:
         server_start = server.wait_until_ready()
-        server_instance_id, weights_id = validate_server_start(server_start, first, device)
+        server_instance_id, prefill_signature = validate_server_start(server_start, first, device)
 
         connection = http.client.HTTPConnection(
             "127.0.0.1", port, timeout=REQUEST_TIMEOUT_SECONDS
@@ -843,7 +862,7 @@ def run_block(
                         f"non-sequential serving request id {request_id}; expected {last_request_id + 1}"
                     )
                 last_request_id = request_id
-                record = build_result_record(spec, weights_id, payload, response, request_done)
+                record = build_result_record(spec, prefill_signature, payload, response, request_done)
                 append_record(run_handle, record)
                 records[spec.key] = record
                 completed = completed_before_block + block_index
@@ -891,11 +910,12 @@ def select_records(
 SUMMARY_FIELDS = (
     "section",
     "target",
-    "weights_id",
+    "prefill_signature",
     "group",
     "fixture",
     "speculative_mode",
     "sampling_mode",
+    "kv_dtype",
     "samples",
     "prompt_tokens_mean",
     "prompt_tokens_stddev",
@@ -942,17 +962,21 @@ def summary_row(
     sampling_mode: str,
     records: Sequence[dict[str, Any]],
 ) -> dict[str, Any]:
-    weights_ids = {str(record.get("weights_id", "")) for record in records}
-    if len(weights_ids) != 1 or not next(iter(weights_ids)):
-        raise CampaignError("summary group does not have one canonical weights_id")
+    prefill_signatures = {str(record.get("prefill_signature", "")) for record in records}
+    if len(prefill_signatures) != 1 or not next(iter(prefill_signatures)):
+        raise CampaignError("summary group does not have one canonical prefill_signature")
+    kv_dtypes = {record["kv_dtype"] for record in records}
+    if len(kv_dtypes) != 1:
+        raise CampaignError("summary group mixes KV dtypes")
     row: dict[str, Any] = {
         "section": section,
         "target": target,
-        "weights_id": next(iter(weights_ids)),
+        "prefill_signature": next(iter(prefill_signatures)),
         "group": group,
         "fixture": fixture,
         "speculative_mode": speculative_mode,
         "sampling_mode": sampling_mode,
+        "kv_dtype": next(iter(kv_dtypes)),
         "samples": len(records),
     }
     set_stats(row, "prompt_tokens", records, "prompt_tokens")
@@ -1136,7 +1160,7 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                 [
                     (
                         row["target"],
-                        row["weights_id"],
+                        row["prefill_signature"],
                         row["fixture"],
                         str(row["samples"]),
                         format_mean_stddev(row, "prompt_tokens"),
@@ -1168,7 +1192,7 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                 [
                     (
                         row["target"],
-                        row["weights_id"],
+                        row["prefill_signature"],
                         row["fixture"],
                         str(row["samples"]),
                         format_mean_stddev(row, "completion_tokens"),
@@ -1201,7 +1225,7 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                 [
                     (
                         row["target"],
-                        row["weights_id"],
+                        row["prefill_signature"],
                         row["group"],
                         str(row["samples"]),
                         format_mean_stddev(row, "decode_tok_s"),
@@ -1219,7 +1243,8 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
     markdown = (
         "# Serving corpus performance summary\n\n"
         "All values are arithmetic mean ± sample standard deviation. "
-        f"Sampling: {rows[0]['sampling_mode'] if rows else 'n/a'}.\n\n"
+        f"Sampling: {rows[0]['sampling_mode'] if rows else 'n/a'}. "
+        f"KV: {rows[0]['kv_dtype'] if rows else 'n/a'}.\n\n"
         + "\n\n".join(sections)
         + "\n"
     )
@@ -1244,7 +1269,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if len(mode_names) != len(set(mode_names)):
         raise CampaignError("duplicate --mode value")
     fixtures = load_fixtures()
-    specs = build_specs(artifacts, fixtures, mode_names, args.sampling)
+    specs = build_specs(artifacts, fixtures, mode_names, args.sampling, args.kv_dtype)
     expected_specs = {spec.key: spec for spec in specs}
     total = len(expected_specs)
 

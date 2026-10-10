@@ -4,13 +4,14 @@
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/oracle.h"
 
+#include <cuda_fp16.h>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <cuda_fp16.h>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -133,6 +134,15 @@ std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
     return bits;
 }
 
+std::vector<std::uint16_t> fp16_bits(const std::vector<float>& values) {
+    std::vector<std::uint16_t> bits(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        const __half value = __float2half_rn(values[i]);
+        std::memcpy(&bits[i], &value, sizeof(value));
+    }
+    return bits;
+}
+
 void context_attention_oracle(const std::vector<float>& q, const std::vector<float>& query_k,
                               const std::vector<float>& query_v,
                               const std::vector<float>& context_k,
@@ -159,30 +169,6 @@ void context_attention_oracle(const std::vector<float>& q, const std::vector<flo
         [&](int d, int head, int token, double value) { out[q_index(d, head, token)] = value; });
 }
 
-
-std::uint16_t f32_to_fp16(float f) {
-    const __half h = __float2half_rn(f);
-    std::uint16_t out = 0;
-    std::memcpy(&out, &h, sizeof(out));
-    return out;
-}
-
-void round_to_fp16(std::vector<float>& v) {
-    for (auto& x : v) {
-        std::uint16_t b = f32_to_fp16(x);
-        std::uint32_t u = std::uint32_t(b) << 16;
-        float f;
-        std::memcpy(&f, &u, 4);
-        x = f;
-    }
-}
-
-std::vector<std::uint16_t> fp16_bits(const std::vector<float>& v) {
-    std::vector<std::uint16_t> out(v.size());
-    for (std::size_t i = 0; i < v.size(); ++i) out[i] = f32_to_fp16(v[i]);
-    return out;
-}
-
 PagedKVBatchLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v,
                                         DeviceBuffer& block_tables, int logical_pages,
                                         int physical_pages, int table_rows = 1) {
@@ -192,8 +178,7 @@ PagedKVBatchLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v,
         .block_tables = Tensor(block_tables.p, DType::I32, {logical_pages, table_rows}),
         .head_dim     = kD,
         .num_kv_heads = kKVHeads,
-        .dtype        = DType::BF16,
-        .quant_group  = 0,
+        .storage      = KvCacheStorage::BFloat16,
     };
 }
 
@@ -251,7 +236,6 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     round_to_bf16(query_v);
     round_to_bf16(context_k);
     round_to_bf16(context_v);
-    round_to_fp16(context_v);
 
     std::vector<double> reference;
     context_attention_oracle(q, query_k, query_v, context_k, context_v, tokens, context_length,
@@ -391,7 +375,6 @@ int graph_mapping_replay_case() {
     round_to_bf16(query_v);
     round_to_bf16(context_k);
     round_to_bf16(context_v);
-round_to_fp16(context_v);
 
     const std::array<std::array<std::int32_t, logical_pages>, 3> replay_mappings{
         std::array<std::int32_t, logical_pages>{0, 1},

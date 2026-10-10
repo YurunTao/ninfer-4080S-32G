@@ -4,8 +4,10 @@
 // HTTP transport live in separate translation units; only wire-independent GenerationRequest is
 // passed to GenerationService.
 
+#include "serve/openai_common.h"
 #include "serve/openai_responses_store.h"
 #include "serve/request.h"
+#include "serve/request_json.h"
 
 #include <nlohmann/json.hpp>
 
@@ -30,6 +32,7 @@ struct OpenAIResponsesFunctionIdentity {
 struct OpenAIResponsesPromptRequest {
     std::string model;
     GenerationRequest generation;
+    OpenAIPromptCachePolicy cache_policy;
     std::vector<ChatTurn> input_turns;
     std::vector<nlohmann::json> input_items;
     std::optional<std::string> instructions;
@@ -38,6 +41,7 @@ struct OpenAIResponsesPromptRequest {
 
 struct OpenAIResponsesCreateRequest {
     OpenAIResponsesPromptRequest prompt;
+    nlohmann::json text_format = {{"type", "text"}};
     nlohmann::json metadata    = nlohmann::json::object();
     nlohmann::json tools       = nlohmann::json::array();
     nlohmann::json tool_choice = "auto";
@@ -71,12 +75,11 @@ struct BuiltOpenAIResponse {
     std::vector<ChatTurn> output_history;
 };
 
-OpenAIResponsesCreateRequest parse_openai_responses_create_request(const nlohmann::json& body,
+OpenAIResponsesCreateRequest parse_openai_responses_create_request(const RequestJson& body,
                                                                    const RequestLimits& limits);
 
 OpenAIResponsesPromptRequest
-parse_openai_responses_input_tokens_request(const nlohmann::json& body,
-                                            const RequestLimits& limits);
+parse_openai_responses_input_tokens_request(const RequestJson& body, const RequestLimits& limits);
 
 OpenAIResponsesResolvedPrompt
 resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,

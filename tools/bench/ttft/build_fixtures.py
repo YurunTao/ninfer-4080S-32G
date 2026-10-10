@@ -8,6 +8,7 @@ never loads a tokenizer, creates images, or calls a token-count endpoint in the 
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -27,6 +28,8 @@ IMAGE_VISION_TOKENS = 1024
 MANY_IMAGE_COUNT = 28
 GENERATED_IMAGE_COUNT = 56
 VISION_TOKEN_LIMIT = 32_768
+ROTATION_55K_LABELS = ("ALPHA", "BRAVO", "COBALT", "DELTA", "EMBER", "FOXTROT")
+ROTATION_55K_SECOND_LABELS = ("OMEGA", "SIGMA", "VIOLET", "THETA", "APPLE", "CHARLIE")
 
 
 def _json_text(value: Any) -> str:
@@ -138,6 +141,22 @@ def _common_rendered_tokens(
             break
         common += 1
     return common
+
+
+def _replace_rotation_label(
+    messages: Sequence[dict[str, Any]], replacement: str
+) -> list[dict[str, Any]]:
+    result = copy.deepcopy(list(messages))
+    if not result or result[0].get("role") != "system":
+        raise RuntimeError("55K rotation fixture has no leading system marker")
+    content = result[0].get("content")
+    if not isinstance(content, str):
+        raise RuntimeError("55K rotation system marker is not text")
+    original, separator, suffix = content.partition(" ")
+    if not separator or len(original) != len(replacement):
+        raise RuntimeError("second 55K cohort label does not preserve fixture shape")
+    result[0]["content"] = replacement + separator + suffix
+    return result
 
 
 def _common_prefix_messages(
@@ -364,6 +383,59 @@ def _file_record(path: Path, **facts: Any) -> dict[str, Any]:
     return {"path": _relative(path), "sha256": _sha256(path), **facts}
 
 
+def build_state_working_set(tokenizer: Any, source_ids: Sequence[int]) -> dict[str, Any]:
+    """Small, early-divergent systems with frozen append-only probe geometry."""
+    roots = []
+    records = {}
+    suffix = "\nInclude one more detail."
+    for label in "abcdef":
+        def candidate(take: int) -> list[dict[str, str]]:
+            body = tokenizer.decode(
+                list(source_ids[:take]), skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            ).strip()
+            return [
+                {"role": "system", "content": f"{label.upper()} reference.\n{body}"},
+                {"role": "user", "content": "Describe the reference in three short sentences."},
+            ]
+
+        low, high = 0, 2100
+        while low < high:
+            middle = (low + high) // 2
+            if _prompt_tokens(tokenizer, candidate(middle)) < 2048:
+                low = middle + 1
+            else:
+                high = middle
+        messages = candidate(low)
+        if _prompt_tokens(tokenizer, messages) != 2048:
+            raise RuntimeError(f"cannot fit state working-set root {label} to 2048 tokens")
+        roots.append(messages)
+        variants = []
+        for turn in range(7):
+            probe = copy.deepcopy(messages)
+            probe[-1]["content"] += suffix * turn
+            variants.append(_prompt_tokens(tokenizer, probe))
+        rendered = _render_template(tokenizer, messages)
+        system = messages[0]["content"]
+        frontier = _stable_frontier(tokenizer, rendered, rendered.index(system) + len(system))
+        path = TEXT_ROOT / f"state_working_set_{label}.json"
+        _write_json(path, messages)
+        records[f"state-2k-{label}"] = _file_record(
+            path, prompt_tokens=2048, max_output_tokens=32,
+            system_frontier_tokens=frontier, probe_suffix=suffix,
+            probe_prompt_tokens=variants,
+        )
+    common = max(
+        _common_rendered_tokens(tokenizer, left, right)
+        for i, left in enumerate(roots) for right in roots[i + 1:]
+    )
+    if common > 3:
+        raise RuntimeError("state working-set roots do not diverge at the first content token")
+    for record in records.values():
+        record["max_peer_common_prefix_tokens"] = common
+    return records
+
+
 def _existing_case(case_name: str, prompt_tokens: int, max_output_tokens: int) -> dict[str, Any]:
     path = REPO_ROOT / "examples" / "cli" / "messages" / f"{case_name}.json"
     return _file_record(
@@ -425,6 +497,44 @@ def build(tokenizer_path: Path) -> None:
         )
     independent_64k_path = TEXT_ROOT / "long_64k_independent.json"
     _write_json(independent_64k_path, independent_64k)
+
+    rotation_55k: list[list[dict[str, str]]] = []
+    rotation_55k_paths: list[Path] = []
+    for index, label in enumerate(ROTATION_55K_LABELS):
+        messages = _fit_user_prompt(
+            tokenizer,
+            source_ids,
+            55000,
+            leading_messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"{label} session: retain this independent TTFT rotation context. "
+                        "Answer the supplied document without referring to another session."
+                    ),
+                }
+            ],
+        )
+        path = TEXT_ROOT / f"rotation_55k_{index}.json"
+        _write_json(path, messages)
+        rotation_55k.append(messages)
+        rotation_55k_paths.append(path)
+    rotation_55k_second = [
+        _replace_rotation_label(messages, ROTATION_55K_SECOND_LABELS[index])
+        for index, messages in enumerate(rotation_55k)
+    ]
+    if any(_prompt_tokens(tokenizer, messages) != 55000 for messages in rotation_55k_second):
+        raise RuntimeError("second 55K cohort does not preserve the exact prompt shape")
+    all_rotation_55k = [*rotation_55k, *rotation_55k_second]
+    rotation_55k_common = max(
+        _common_rendered_tokens(tokenizer, all_rotation_55k[left], all_rotation_55k[right])
+        for left in range(len(all_rotation_55k))
+        for right in range(left + 1, len(all_rotation_55k))
+    )
+    if rotation_55k_common > 3:
+        raise RuntimeError(
+            "55K rotation fixtures do not diverge at the first system-content token"
+        )
 
     exact = _fit_user_prompt(tokenizer, source_ids, 8129)
     over = _fit_user_prompt(tokenizer, source_ids, 8193)
@@ -512,10 +622,20 @@ def build(tokenizer_path: Path) -> None:
                 max_output_tokens=32,
                 seed_common_prefix_tokens=independent_64k_common,
             ),
+            **{
+                f"rotation-55k-{index}": _file_record(
+                    path,
+                    prompt_tokens=55000,
+                    max_output_tokens=32,
+                    max_peer_common_prefix_tokens=rotation_55k_common,
+                    second_cohort_label=ROTATION_55K_SECOND_LABELS[index],
+                    second_cohort_prompt_tokens=55000,
+                )
+                for index, path in enumerate(rotation_55k_paths)
+            },
             "long-256k-32": _existing_case("long_niah_256k", 260096, 32),
             "interferer-256": _existing_case("scenario_story_zh_scifi", 127, 256),
             "holder-4096": _existing_case("scenario_story_zh_scifi", 127, 4096),
-            "medium-3000": _existing_case("text_smoke_zh", 30, 3000),
             "context-exact": _file_record(
                 exact_path, prompt_tokens=8129, max_output_tokens=64
             ),
@@ -610,6 +730,7 @@ def build(tokenizer_path: Path) -> None:
             ],
         },
     }
+    manifest["shapes"].update(build_state_working_set(tokenizer, source_ids))
     _write_json(FIXTURE_ROOT / "manifest.json", manifest)
 
 
@@ -656,6 +777,41 @@ def check() -> None:
         raise RuntimeError(
             "33-image fixture does not exceed the Vision envelope, so it cannot audit the trim"
         )
+
+    rotation = [manifest["shapes"].get(f"rotation-55k-{index}") for index in range(6)]
+    if any(
+        not isinstance(record, dict)
+        or record.get("prompt_tokens") != 55000
+        or record.get("max_output_tokens") != 32
+        or record.get("max_peer_common_prefix_tokens", 4) > 3
+        or record.get("second_cohort_prompt_tokens") != 55000
+        or not isinstance(record.get("second_cohort_label"), str)
+        for record in rotation
+    ):
+        raise RuntimeError("55K rotation fixtures are outside their qualified shape")
+    if len({record["path"] for record in rotation}) != 6 or len(
+        {record["sha256"] for record in rotation}
+    ) != 6:
+        raise RuntimeError("55K rotation fixtures are not byte-distinct")
+    original_labels: list[str] = []
+    for record in rotation:
+        messages = json.loads((REPO_ROOT / record["path"]).read_text(encoding="utf-8"))
+        system = messages[0].get("content") if isinstance(messages, list) and messages else None
+        original, separator, _ = system.partition(" ") if isinstance(system, str) else ("", "", "")
+        if not original or not separator:
+            raise RuntimeError("55K rotation fixture has no system label")
+        original_labels.append(original)
+    second_labels = [record["second_cohort_label"] for record in rotation]
+    if (
+        len(set(original_labels)) != len(rotation)
+        or len(set(second_labels)) != len(rotation)
+        or set(second_labels) & set(original_labels)
+        or any(
+            len(original) != len(second)
+            for original, second in zip(original_labels, second_labels, strict=True)
+        )
+    ):
+        raise RuntimeError("55K rotation cohort labels are not shape-preserving and distinct")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

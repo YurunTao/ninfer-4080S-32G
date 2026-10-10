@@ -1,10 +1,11 @@
+#include "core/weight.h"
 #include "ops/linear_topk/linear_topk_launch.h"
 
 #include "core/device.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/fp8/fp8_a16_codec.cuh"
-#include "ops/linear/fp8/fp8_config.h"
+#include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear_topk/grouped_ksplit_topk.cuh"
 
 #include <array>
@@ -21,22 +22,22 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_groupe
     const __nv_bfloat16* __restrict__ hidden, const std::uint8_t* __restrict__ weight_codes,
     const __nv_bfloat16* __restrict__ row_scales, std::int32_t valid_rows,
     std::uint64_t* __restrict__ partial_keys, std::int32_t producer_groups, int columns) {
-    constexpr int kHidden    = Fp8VocabularyGeometry::kInputRows;
+    constexpr int kHidden    = Fp8N248320K5120::kInputRows;
     constexpr int kTileK     = Schedule::kTileKPerWarp;
     constexpr int kWarps     = Schedule::kKWarps;
-    constexpr int kRows      = Schedule::kRowsPerCta;
-    constexpr int kGroupK    = Schedule::kGroupK;
-    constexpr int kGroups    = kHidden / kGroupK;
-    constexpr int kTileCols  = Schedule::kTileTokens;
+    constexpr int kRows      = Schedule::kBlockRows;
+    constexpr int kBlockK    = Schedule::kBlockK;
+    constexpr int kGroups    = kHidden / kBlockK;
+    constexpr int kTileCols  = Schedule::kBlockTokens;
     constexpr int kTokenMmas = kTileCols / 8;
     constexpr int kRowTiles  = kLinearTopKGroupedRows / kRows;
     static_assert(kRows == 16 && kLinearTopKGroupedRows == 128);
-    static_assert((kHidden % kGroupK) == 0);
+    static_assert((kHidden % kBlockK) == 0);
     static_assert(Capacity <= kTileCols);
 
     union SharedStorage {
         struct {
-            std::uint8_t codes[kRows][kGroupK];
+            std::uint8_t codes[kRows][kBlockK];
             __nv_bfloat16 activations[kWarps][kTileCols * kTileK];
         } staging;
 
@@ -72,7 +73,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_groupe
                 cp_async_zfill<16, Cache::ca>(
                     &x_shared[warp][column * kTileK + fp8_a16_shared_col_64(column, k8 * 8)],
                     hidden + static_cast<std::int64_t>(source) * kHidden + group_k0 +
-                        warp * kTileK + k8 * 8, column < columns ? 16 : 0);
+                        warp * kTileK + k8 * 8,
+                    column < columns ? 16 : 0);
             }
         };
 
@@ -81,7 +83,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_groupe
             for (int row_item = 0; row_item < Schedule::kRowsPerLoaderWarp; ++row_item) {
                 const int local_row = warp * Schedule::kRowsPerLoaderWarp + row_item;
                 const int row       = row_begin + local_row;
-                for (int chunk = lane; chunk < kGroupK / 16; chunk += 32) {
+                for (int chunk = lane; chunk < kBlockK / 16; chunk += 32) {
                     const int swizzled_chunk = chunk ^ (local_row & 7);
                     cp_async<16, Cache::cg>(&code_shared[local_row][swizzled_chunk * 16],
                                             weight_codes +
@@ -131,7 +133,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_groupe
 
             if (group_index + 1 < kGroups) {
                 __syncthreads();
-                const int next_k0 = (group_index + 1) * kGroupK;
+                const int next_k0 = (group_index + 1) * kBlockK;
                 stage_codes(next_k0);
                 stage_activation(next_k0);
                 cp_commit();
@@ -208,8 +210,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_groupe
             }
         }
         __syncthreads();
-        grouped_ksplit_topk_consume<Capacity, kTileCols, kWarps>(partial, topk,
-                                                                             row_begin, valid_rows, columns);
+        grouped_ksplit_topk_consume<Capacity, kTileCols, kWarps>(partial, topk, row_begin,
+                                                                 valid_rows, columns);
     }
 
     grouped_ksplit_topk_publish(topk, partial_keys, producer_groups, columns);
@@ -220,15 +222,15 @@ using Launch = void (*)(const Tensor&, const Weight&, std::int32_t, const Linear
 
 template <int Capacity>
 void launch_tile(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
-                  const LinearTopKWorkspace& workspace, cudaStream_t stream) {
-    using Schedule =
-        Fp8A16SmallTMmaSchedule<8, Capacity, 2>;
+                 const LinearTopKWorkspace& workspace, cudaStream_t stream) {
+    using Schedule = Fp8A16SlicedKMmaSchedule<8, Capacity, 2>;
     fp8_grouped_ksplit_topk_kernel<Capacity, Schedule>
         <<<workspace.producer_groups, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(hidden.data),
             static_cast<const std::uint8_t*>(head.qdata),
             static_cast<const __nv_bfloat16*>(head.scales), valid_rows,
-            static_cast<std::uint64_t*>(workspace.partial_keys.data), workspace.producer_groups, hidden.ne[1]);
+            static_cast<std::uint64_t*>(workspace.partial_keys.data), workspace.producer_groups,
+            hidden.ne[1]);
     CUDA_CHECK(cudaGetLastError());
 }
 

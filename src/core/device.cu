@@ -4,10 +4,32 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace ninfer {
 namespace {
+
+struct SyncSchedule {
+    std::string_view name;
+    unsigned int flags;
+};
+
+constexpr SyncSchedule kSyncSchedules[] = {
+    {"spin", cudaDeviceScheduleSpin},
+    {"blocking", cudaDeviceScheduleBlockingSync},
+    {"yield", cudaDeviceScheduleYield},
+    {"auto", cudaDeviceScheduleAuto},
+};
+
+unsigned int sync_schedule_from_environment() {
+    const char* value = std::getenv("NINFER_CUDA_SYNC");
+    if (value == nullptr) { return cudaDeviceScheduleSpin; }
+    for (const auto& schedule : kSyncSchedules) {
+        if (schedule.name == value) { return schedule.flags; }
+    }
+    throw std::invalid_argument("NINFER_CUDA_SYNC must be spin, blocking, yield, or auto");
+}
 
 std::string cuda_error_message(const char* prefix, cudaError_t err) {
     return std::string(prefix) + ": " + cudaGetErrorName(err) + ": " + cudaGetErrorString(err);
@@ -44,6 +66,7 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
 }
 
 DeviceContext::DeviceContext(int device_id) : device(device_id) {
+    const unsigned int sync_flags = sync_schedule_from_environment();
     int count       = 0;
     cudaError_t err = cudaGetDeviceCount(&count);
     if (err != cudaSuccess) {
@@ -53,6 +76,11 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
     if (device_id < 0 || device_id >= count) { throw std::runtime_error("invalid CUDA device id"); }
 
     bind_to_current_thread();
+
+    err = cudaSetDeviceFlags(sync_flags);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaSetDeviceFlags failed", err));
+    }
 
     err = cudaGetDeviceProperties(&props, device_id);
     if (err != cudaSuccess) {
@@ -119,7 +147,13 @@ void DeviceContext::bind_to_current_thread_noexcept() const noexcept {
     log_cuda_error("cudaSetDevice", cudaSetDevice(device));
 }
 
-int DeviceContext::sm() const noexcept { return props.major * 10 + props.minor; }
+int DeviceContext::compute_capability() const noexcept { return props.major * 10 + props.minor; }
+
+int DeviceContext::multiprocessor_count() const noexcept { return props.multiProcessorCount; }
+
+DeviceExecutionView DeviceContext::execution_view() const noexcept {
+    return {.stream = stream, .multiprocessor_count = multiprocessor_count()};
+}
 
 int DeviceContext::compute_capability() const noexcept { return props.major * 10 + props.minor; }
 
@@ -130,6 +164,19 @@ DeviceExecutionView DeviceContext::execution_view() const noexcept {
 }
 
 std::size_t DeviceContext::total_vram() const noexcept { return props.totalGlobalMem; }
+
+const char* DeviceContext::sync_mode() const {
+    bind_to_current_thread();
+    unsigned int flags    = 0;
+    const cudaError_t err = cudaGetDeviceFlags(&flags);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaGetDeviceFlags failed", err));
+    }
+    for (const auto& schedule : kSyncSchedules) {
+        if ((flags & cudaDeviceScheduleMask) == schedule.flags) { return schedule.name.data(); }
+    }
+    throw std::runtime_error("unknown CUDA synchronization schedule");
+}
 
 void DeviceContext::synchronize() const { CUDA_CHECK(cudaStreamSynchronize(stream)); }
 
@@ -233,6 +280,13 @@ void CudaCompletionEvent::wait(cudaStream_t stream) const {
         throw std::logic_error("CUDA completion event is not waitable");
     }
     CUDA_CHECK(cudaStreamWaitEvent(stream, event_, 0));
+}
+
+void CudaCompletionEvent::record_external(cudaStream_t stream) {
+    if (event_ == nullptr || stream == nullptr) {
+        throw std::logic_error("CUDA completion event is not recordable");
+    }
+    CUDA_CHECK(cudaEventRecordWithFlags(event_, stream, cudaEventRecordExternal));
 }
 
 bool CudaCompletionEvent::ready() const {

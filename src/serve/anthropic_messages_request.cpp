@@ -17,7 +17,7 @@
 namespace ninfer::serve {
 namespace {
 
-using Json = nlohmann::json;
+using Json = RequestJson;
 
 constexpr std::size_t kMaxToolNameLength = 128;
 
@@ -28,12 +28,6 @@ enum class ParsePurpose {
 
 [[noreturn]] void invalid_tool_history(std::string message) {
     bad_request(std::move(message), "messages", "invalid_tool_history");
-}
-
-[[noreturn]] void invalid_thinking_signature() {
-    bad_request("assistant Thinking blocks must include the signature returned by NInfer and be "
-                "passed back unmodified",
-                "messages", "invalid_thinking_signature");
 }
 
 const Json& require_object(const Json& body) {
@@ -305,7 +299,7 @@ std::vector<ParsedUserBlock> parse_user_blocks(const Json& content) {
     return result;
 }
 
-ChatTurn parse_assistant_blocks(const Json& content, const AnthropicThinkingSigner& signer) {
+ChatTurn parse_assistant_blocks(const Json& content) {
     ChatTurn assistant;
     assistant.role = ChatRole::Assistant;
     for (std::size_t index = 0; index < content.size(); ++index) {
@@ -322,13 +316,8 @@ ChatTurn parse_assistant_blocks(const Json& content, const AnthropicThinkingSign
             }
             const std::string thinking =
                 require_string(block, "thinking", "messages", "thinking block");
-            if (!block.contains("signature") || !block.at("signature").is_string()) {
-                invalid_thinking_signature();
-            }
-            const std::string signature = block.at("signature").get<std::string>();
-            if (signature.empty() || !signer.verify(thinking, index, signature)) {
-                invalid_thinking_signature();
-            }
+            // NInfer has no encrypted reasoning state to restore. The wire signature is therefore
+            // intentionally outside the lowered request; only visible Thinking reaches the model.
             assistant.reasoning_content += thinking;
         } else if (type == "redacted_thinking") {
             if (cache_boundary(block, "messages")) {
@@ -357,17 +346,20 @@ ChatTurn parse_assistant_blocks(const Json& content, const AnthropicThinkingSign
     return assistant;
 }
 
-ChatTurn parse_system_value(const Json& value, const char* param) {
+ChatTurn parse_system_value(const Json& value, const char* param, std::size_t first_block = 0) {
     ChatTurn system;
     system.role = ChatRole::System;
     if (value.is_string()) {
+        if (first_block != 0) { throw std::logic_error("string system value has a block offset"); }
         system.content.push_back(text_part(value.get<std::string>()));
         return system;
     }
     if (!value.is_array()) {
         bad_request("system content must be a string or an array of text blocks", param);
     }
-    for (const Json& block : value) {
+    if (first_block > value.size()) { throw std::logic_error("system block offset is invalid"); }
+    for (std::size_t index = first_block; index < value.size(); ++index) {
+        const Json& block = value[index];
         if (require_block_type(block, param) != "text") {
             bad_request("only text system blocks are supported", param,
                         "content_block_not_supported");
@@ -381,7 +373,20 @@ ChatTurn parse_system_value(const Json& value, const char* param) {
 
 void parse_system(const Json& body, GenerationRequest& request) {
     if (!body.contains("system") || body.at("system").is_null()) { return; }
-    request.messages.push_back(parse_system_value(body.at("system"), "system"));
+    const Json& value                             = body.at("system");
+    constexpr std::string_view kAttributionPrefix = "x-anthropic-billing-header:";
+    std::size_t first_block                       = 0;
+    if (value.is_array() && !value.empty()) {
+        const Json& first = value.front();
+        if (first.is_object() && first.contains("type") && first.at("type").is_string() &&
+            first.at("type").get_ref<const std::string&>() == "text" && first.contains("text") &&
+            first.at("text").is_string() &&
+            first.at("text").get_ref<const std::string&>().starts_with(kAttributionPrefix)) {
+            first_block = 1;
+        }
+    }
+    ChatTurn system = parse_system_value(value, "system", first_block);
+    if (!system.content.empty()) { request.messages.push_back(std::move(system)); }
 }
 
 std::vector<ParsedMessage> normalize_same_role_messages(std::vector<ParsedMessage> messages) {
@@ -542,8 +547,7 @@ void lower_messages(std::vector<ParsedMessage> messages, GenerationRequest& requ
     }
 }
 
-void parse_messages(const Json& body, GenerationRequest& request,
-                    const AnthropicThinkingSigner& signer) {
+void parse_messages(const Json& body, GenerationRequest& request) {
     if (!body.contains("messages")) { bad_request("missing required field: messages", "messages"); }
     const Json& messages = body.at("messages");
     if (!messages.is_array() || messages.empty()) {
@@ -614,7 +618,7 @@ void parse_messages(const Json& body, GenerationRequest& request,
             bad_request("message content must be a string or an array", "messages");
         }
         if (role == ChatRole::Assistant) {
-            message.turn = parse_assistant_blocks(content, signer);
+            message.turn = parse_assistant_blocks(content);
         } else {
             message.user_blocks = parse_user_blocks(content);
         }
@@ -685,7 +689,6 @@ struct ParsedTool {
     ToolDefinition definition;
     ToolSource source = ToolSource::UserDefined;
     std::string source_type;
-    bool strict        = false;
     bool defer_loading = false;
     std::optional<std::vector<std::string>> allowed_callers;
 };
@@ -695,9 +698,12 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
     if (!body.contains("tools") || body.at("tools").is_null()) { return result; }
     if (!body.at("tools").is_array()) { bad_request("tools must be an array", "tools"); }
     std::unordered_set<std::string> names;
+    std::size_t source_index = 0;
     for (const Json& item : body.at("tools")) {
         if (!item.is_object()) { bad_request("tools entries must be objects", "tools"); }
         ParsedTool parsed;
+        parsed.definition.schema_param =
+            "tools/" + std::to_string(source_index++) + "/input_schema";
         if (item.contains("type") && !item.at("type").is_null()) {
             if (!item.at("type").is_string()) {
                 bad_request("tool type must be a string or null", "tools");
@@ -744,7 +750,7 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
             if (!item.at("strict").is_boolean()) {
                 bad_request("tool strict must be a boolean", "tools");
             }
-            parsed.strict = item.at("strict").get<bool>();
+            parsed.definition.strict = item.at("strict").get<bool>();
         }
         if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
             if (!item.at("defer_loading").is_boolean()) {
@@ -784,19 +790,17 @@ void lower_tools(const Json& body, GenerationRequest& request) {
         if (std::none_of(definitions.begin(), definitions.end(), named)) {
             bad_request("tool_choice references unknown tool: " + selection.name, "tool_choice");
         }
-        bad_request("tool_choice.type='tool' requires that exact tool to be called, which NInfer "
-                    "cannot guarantee",
-                    "tool_choice", "tool_choice_not_supported");
+        request.tool_choice.allowed_names = std::vector<std::string>{selection.name};
     }
     if (selection.kind == ToolSelectionKind::Any) {
         if (definitions.empty()) { bad_request("tool_choice requires tools", "tool_choice"); }
-        bad_request("tool_choice.type='any' requires at least one tool call, which NInfer cannot "
-                    "guarantee",
-                    "tool_choice", "tool_choice_not_supported");
     }
 
-    request.tool_choice.mode =
-        selection.kind == ToolSelectionKind::None ? ToolChoiceMode::None : ToolChoiceMode::Auto;
+    request.tool_choice.mode     = selection.kind == ToolSelectionKind::None ? ToolChoiceMode::None
+                                   : selection.kind == ToolSelectionKind::Auto
+                                       ? ToolChoiceMode::Auto
+                                       : ToolChoiceMode::Required;
+    request.tool_choice.parallel = !selection.disable_parallel;
     if (selection.kind == ToolSelectionKind::None) {
         for (ParsedTool& tool : definitions) {
             if (tool.source == ToolSource::UserDefined) {
@@ -817,11 +821,6 @@ void lower_tools(const Json& body, GenerationRequest& request) {
                             "NInfer does not provide",
                         "tools", "anthropic_tools_not_supported");
         }
-        if (tool.strict) {
-            bad_request("strict=true requires generated tool input to satisfy the declared JSON "
-                        "Schema, which NInfer cannot guarantee",
-                        "tools", "strict_tools_not_supported");
-        }
         if (tool.defer_loading) {
             bad_request("defer_loading=true requires a deferred tool loader that NInfer does not "
                         "provide",
@@ -835,11 +834,6 @@ void lower_tools(const Json& body, GenerationRequest& request) {
                         "tools", "tool_caller_not_supported");
         }
         request.tools.push_back(std::move(tool.definition));
-    }
-    if (selection.disable_parallel && !request.tools.empty()) {
-        bad_request("disable_parallel_tool_use=true requires at most one tool call, which NInfer "
-                    "cannot guarantee",
-                    "tool_choice", "parallel_tool_use_not_supported");
     }
 }
 
@@ -895,9 +889,8 @@ void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose pur
     if (!config.is_object()) { bad_request("output_config must be an object", "output_config"); }
     if (purpose == ParsePurpose::Messages && config.contains("format") &&
         !config.at("format").is_null()) {
-        bad_request("output_config.format requires constrained decoding, which NInfer does not "
-                    "provide",
-                    "output_config.format", "output_config_format_not_supported");
+        parse_json_output_format(config["format"], request, "output_config.format",
+                                 JsonFormatProtocol::Anthropic);
     }
     if (!config.contains("effort") || config.at("effort").is_null()) { return; }
     if (!config.at("effort").is_string()) {
@@ -966,7 +959,7 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
             explicit_boundaries.push_back(&turn.cache_boundary_after);
         }
     }
-    if (explicit_boundaries.size() > 4U) {
+    if (explicit_boundaries.size() > kMaximumExplicitPromptCacheMarkers) {
         bad_request("at most four block-level cache_control breakpoints are supported per request",
                     "cache_control", "too_many_cache_breakpoints");
     }
@@ -1000,7 +993,7 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
         automatic_target->value().evidence |= ninfer::SharedCandidateEvidence::RequestedAutomatic;
         return;
     }
-    if (explicit_boundaries.size() == 4U) {
+    if (explicit_boundaries.size() == kMaximumExplicitPromptCacheMarkers) {
         bad_request("request-level cache_control needs a fifth distinct cache write after four "
                     "block-level breakpoints",
                     "cache_control", "too_many_cache_breakpoints");
@@ -1012,10 +1005,10 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
 }
 
 void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurpose purpose,
-                         int effective_max_tokens, const AnthropicThinkingSigner& signer) {
+                         int effective_max_tokens) {
     lower_tools(body, request);
     parse_system(body, request);
-    parse_messages(body, request, signer);
+    parse_messages(body, request);
     parse_thinking(body, request, purpose, effective_max_tokens);
     parse_effort(body, request, purpose);
     apply_anthropic_prompt_cache_policy(body, request);
@@ -1023,6 +1016,11 @@ void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurp
         bad_request("container requires an external execution environment that NInfer does not "
                     "provide",
                     "container", "container_not_supported");
+    }
+    if (body.contains("chat_template_kwargs") && !body.at("chat_template_kwargs").is_null()) {
+        if (!body.at("chat_template_kwargs").is_object())
+            bad_request("chat_template_kwargs must be an object", "chat_template_kwargs");
+        request.chat_template_kwargs_json = body.at("chat_template_kwargs").dump();
     }
     if (body.contains("preserve_thinking") && !body.at("preserve_thinking").is_null()) {
         if (!body.at("preserve_thinking").is_boolean()) {
@@ -1035,8 +1033,7 @@ void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurp
 } // namespace
 
 AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
-                                                          const RequestLimits& limits,
-                                                          const AnthropicThinkingSigner& signer) {
+                                                          const RequestLimits& limits) {
     require_object(body);
     AnthropicMessagesRequest result;
     result.model                           = parse_model(body);
@@ -1058,19 +1055,19 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
     }
 
     parse_common_prompt(body, result.generation, ParsePurpose::Messages,
-                        result.generation.max_tokens, signer);
+                        result.generation.max_tokens);
     parse_generation_fields(body, result.generation);
+    parse_structured_outputs(body, result.generation);
     return result;
 }
 
-AnthropicCountTokensRequest
-parse_anthropic_count_tokens_request(const Json& body, const AnthropicThinkingSigner& signer) {
+AnthropicCountTokensRequest parse_anthropic_count_tokens_request(const Json& body) {
     require_object(body);
     AnthropicCountTokensRequest result;
     result.model                           = parse_model(body);
     result.generation.tool_name_max_length = kMaxToolNameLength;
     parse_common_prompt(body, result.generation, ParsePurpose::CountTokens,
-                        std::numeric_limits<int>::max(), signer);
+                        std::numeric_limits<int>::max());
     return result;
 }
 

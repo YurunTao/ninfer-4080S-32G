@@ -31,7 +31,40 @@ int check(bool condition, const char* message) {
 } // namespace
 
 int main() {
-    int failures = 0;
+    int failures      = 0;
+    const auto choice = parse({"ninfer", "model.ninfer", "--prompt", "hello", "--choice", "",
+                               "--choice", "a|b", "--choice", "你好"});
+    failures += check(choice.choices == std::vector<std::string>{"", "a|b", "你好"},
+                      "choice flags changed literal text or order");
+    failures +=
+        check(parse({"ninfer", "model.ninfer", "--prompt", "hello", "--regex", ""}).regex == "",
+              "empty regex must be distinct from no regex");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer", "model.ninfer", "--prompt", "hello", "--regex", "",
+                                       "--choice", "yes"});
+                      }),
+                      "regex and choice were accepted together");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer", "model.ninfer", "--prompt", "hello", "--regex",
+                                       "a", "--json-object"});
+                      }),
+                      "regex and JSON were accepted together");
+    failures += check(
+        parse({"ninfer", "model.ninfer", "--prompt", "hello", "--grammar-file", "answer.gbnf"})
+                .grammar_path == "answer.gbnf",
+        "grammar file argument was lost");
+    failures +=
+        check(parse({"ninfer", "model.ninfer", "--prompt", "hello", "--json-object"}).json_object,
+              "JSON object CLI option lost");
+    failures += check(
+        parse({"ninfer", "model.ninfer", "--prompt", "hello", "--json-schema-file", "answer.json"})
+                .json_schema_path == "answer.json",
+        "schema file CLI option lost");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer", "model.ninfer", "--prompt", "hello",
+                                       "--json-object", "--grammar-file", "a.gbnf"});
+                      }),
+                      "conflicting CLI constraints accepted");
     const ninfer::cli::Options configured =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--thinking-budget", "37"});
     failures += check(configured.thinking_budget == 37,
@@ -54,6 +87,51 @@ int main() {
                "--reasoning-effort", "medium"});
     failures += check(with_effort.thinking_budget == 8 && with_effort.reasoning_effort,
                       "thinking budget did not coexist with reasoning effort");
+    const ninfer::cli::Options dflash_vision =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--vision", "--spec", "dflash",
+               "--draft-tokens", "7"});
+    failures += check(dflash_vision.enable_vision &&
+                          dflash_vision.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
+                          dflash_vision.speculative.draft_tokens == 7,
+                      "CLI did not preserve the combined DFlash and Vision startup features");
+    for (const auto k : {1U, 2U, 7U, 15U}) {
+        const auto dflash2 = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                    "dflash2", "--draft-tokens", std::to_string(k)});
+        failures += check(dflash2.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
+                              dflash2.speculative.draft_tokens == k,
+                          "CLI did not preserve the DFlash2 draft count");
+    }
+    for (const auto k : {0U, 16U}) {
+        failures +=
+            check(rejects([&] {
+                      (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                   "dflash2", "--draft-tokens", std::to_string(k)});
+                  }),
+                  "CLI accepted an unsupported DFlash2 draft count");
+    }
+    const ninfer::cli::Options nvfp4 =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "nvfp4"});
+    failures += check(nvfp4.kv_cache == ninfer::KvCacheStorage::Nvfp4Group16,
+                      "--kv-dtype nvfp4 did not select group-16 NVFP4 KV");
+    const ninfer::cli::Options k8v4 =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "k8v4"});
+    failures += check(k8v4.kv_cache == ninfer::KvCacheStorage::Fp8KeyNvfp4Value,
+                      "--kv-dtype k8v4 did not select asymmetric K8V4 KV");
+    const std::string help = ninfer::cli::usage_text("ninfer-cli");
+    failures +=
+        check(help.find("nvfp4") != std::string::npos && help.find("k8v4") != std::string::npos,
+              "CLI help omits a production KV storage mode");
+    const ninfer::cli::Options logging =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--log-level", "debug"});
+    failures += check(logging.log_level == ninfer::product::LogLevel::Debug,
+                      "CLI log level was not parsed");
+    failures += check(help.find("--log-level") != std::string::npos,
+                      "CLI help omits the log-level control");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--log-level", "verbose"});
+                      }),
+                      "CLI accepted an unknown log level");
     failures +=
         check(rejects([] {
                   (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "21"});

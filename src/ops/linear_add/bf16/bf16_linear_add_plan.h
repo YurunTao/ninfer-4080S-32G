@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/weight.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
@@ -9,9 +10,9 @@
 namespace ninfer::ops::detail {
 
 inline constexpr std::int32_t kBf16LinearAddSmallTMinTokens   = 2;
-inline constexpr std::int32_t kBf16LinearAddSmallTMaxTokens   = 32;
+inline constexpr std::int32_t kBf16LinearAddSmallTMaxTokens   = 4;
 inline constexpr std::int32_t kBf16LinearAddSmallTDispatchEnd = 4;
-inline constexpr std::int32_t kBf16LinearAddAggregateMmaEnd   = 48;
+inline constexpr std::int32_t kBf16LinearAddAggregateMmaEnd   = 64;
 
 enum class Bf16LinearAddScheduleId : std::uint8_t {
     Decode,

@@ -1,11 +1,17 @@
+#include "core/weight.h"
 #include "ninfer/ops/linear.h"
 
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "ops/direct_bf16_weight.h"
 #include "ops/op_tester.h"
+#include "ops/linear/linear_test_common.h"
 
 #include <algorithm>
+#include <array>
+#include <initializer_list>
+#include <limits>
+#include <set>
 #include <cmath>
 #include <cstdint>
 #include <exception>
@@ -88,12 +94,12 @@ std::vector<std::int32_t> sampled_tokens(std::int32_t tokens) {
     return result;
 }
 
-int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens) {
-    const std::int32_t rows                          = weight.host.n;
-    const std::int32_t hidden                        = weight.host.k;
-    const std::vector<std::uint16_t> activation_bits = make_activation_bits(hidden, tokens);
-    const std::vector<float> activation              = materialize(activation_bits);
-    DeviceBuffer device_activation                   = to_device(activation_bits);
+int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens, bool replay = false) {
+    const std::int32_t rows                    = weight.host.n;
+    const std::int32_t hidden                  = weight.host.k;
+    std::vector<std::uint16_t> activation_bits = make_activation_bits(hidden, tokens);
+    std::vector<float> activation              = materialize(activation_bits);
+    DeviceBuffer device_activation             = to_device(activation_bits);
     GuardedDeviceBuffer guarded_output(static_cast<std::size_t>(rows) * tokens *
                                        sizeof(std::uint16_t));
     guarded_output.fill(0xff);
@@ -104,7 +110,26 @@ int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens) {
     ops::linear(x, weight.view(), output, ops::LinearPolicy::A16Only, workspace, nullptr);
     cuda_synchronize();
 
-    const std::string suffix = " T=" + std::to_string(tokens);
+    if (replay) {
+        DeviceContext context;
+        DecodeGraphDefinition definition;
+        DecodeGraphExecutable graph;
+        definition.capture(context.stream, [&] {
+            ops::linear(x, weight.view(), output, ops::LinearPolicy::A16Only, workspace,
+                        context.stream);
+        });
+        graph.instantiate(definition);
+        graph.launch(context.stream);
+        cuda_synchronize();
+        for (auto& bits : activation_bits) bits ^= 0x8000;
+        activation = materialize(activation_bits);
+        device_activation.copy_from_host(activation_bits.data(), device_activation.bytes);
+        guarded_output.fill(0xff);
+        cuda_synchronize();
+        graph.launch(context.stream);
+        cuda_synchronize();
+    }
+    const std::string suffix = " T=" + std::to_string(tokens) + (replay ? " graph" : " eager");
     int failures             = guarded_output.verify_guards("BF16_A16 Linear output" + suffix);
     const std::vector<std::uint16_t> output_bits =
         from_device<std::uint16_t>(guarded_output.data(), static_cast<std::size_t>(rows) * tokens);
@@ -156,7 +181,7 @@ int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens) {
 }
 
 int run_selector_linear() {
-    constexpr int n = 256, k = 5120, max_t = 1024;
+    constexpr int n = 256, k = 5120, max_t = 2048;
     DeviceWeight weight(make_patterned(n, k, 419U));
     const auto bits       = make_activation_bits(k, max_t);
     const auto activation = materialize(bits);
@@ -179,7 +204,7 @@ int run_selector_linear() {
     int failures   = 0;
     const auto run = [&](int tokens, bool replay) {
         const auto capacity = ops::linear_workspace_capacity_bytes(
-            QType::BF16_CTRL, n, k, ops::LinearPolicy::A16Only, tokens, tokens);
+            QType::BF16, n, k, ops::LinearPolicy::A16Only, tokens, tokens);
         DeviceArena scratch(std::max<std::size_t>(capacity, 256));
         GuardedDeviceBuffer output_buffer(static_cast<std::size_t>(n) * tokens * 2);
         Tensor x(input.p, DType::BF16, {k, tokens});
@@ -227,8 +252,11 @@ int run_selector_linear() {
         if (replay) input.copy_from_host(bits.data(), input.bytes);
     };
     for (int tokens = 1; tokens <= 120; ++tokens) run(tokens, false);
-    for (int tokens : {121, 127, 128, 129, 256, 1024}) run(tokens, false);
-    for (int tokens : {1, 7, 8, 15, 16, 63, 64, 65, 76, 77, 80, 81, 119, 120, 129, 1024})
+    for (int tokens : {121, 127, 128,  129,  159,  160,  161,  162,  256,  639,  640,
+                       641, 642, 1023, 1024, 1025, 1026, 1279, 1280, 1281, 1282, 2048})
+        run(tokens, false);
+    for (int tokens : {1,   7,   8,   15,  16,  63,  64,  65,   76,   77,   80,   81,
+                       119, 120, 129, 160, 161, 640, 641, 1024, 1025, 1280, 1281, 2048})
         run(tokens, true);
     failures += weight.verify_preserved("BF16 selector weight");
     return failures;
@@ -237,27 +265,222 @@ int run_selector_linear() {
 int run_bf16_linear() {
     int failures = 0;
     DeviceWeight attention_weight(make_patterned(14336, 5120, 401U));
-    for (const std::int32_t tokens : {1, 2, 4, 8, 16, 17, 27, 28, 32, 33, 128, 129, 1024}) {
-        failures += run_bf16_linear_case(attention_weight, tokens);
-    }
     DeviceWeight output_weight(make_patterned(5120, 6144, 409U));
-    for (const std::int32_t tokens : {1, 2, 4, 8, 16, 27, 28, 32, 33, 127, 128, 129, 1024, 1536}) {
-        failures += run_bf16_linear_case(output_weight, tokens);
+    for (DeviceWeight* weight : {&attention_weight, &output_weight}) {
+        for (int tokens = 1; tokens <= 33; ++tokens) {
+            failures += run_bf16_linear_case(*weight, tokens);
+        }
+        for (int tokens :
+             {63, 64, 65, 66, 95, 96, 97, 98, 127, 128, 129, 130, 191, 192, 193, 194, 1024, 1536}) {
+            failures += run_bf16_linear_case(*weight, tokens);
+        }
+        for (int tokens : {3, 7, 13, 19, 23, 25, 29, 33, 64, 65, 97, 129, 193}) {
+            failures += run_bf16_linear_case(*weight, tokens, true);
+        }
     }
     failures += run_selector_linear();
     return failures;
 }
 
+enum class ColumnDomain { Text, RawPatch, Merger };
+
+struct Geometry {
+    int n, k;
+    std::initializer_list<int> boundaries;
+    ColumnDomain domain = ColumnDomain::Text;
+};
+
+constexpr std::array kNewGeometries{
+    Geometry{48, 2560, {1, 8, 12, 16, 128}},
+    Geometry{96, 2560, {1, 4, 16, 128, 512}},
+    Geometry{1664, 2560, {1, 16, 48, 64, 96, 128, 512}},
+    Geometry{324, 10240, {1, 8, 48, 96, 128, 512}},
+    Geometry{320, 10240, {1, 8, 48, 96, 128, 512}},
+    Geometry{10240, 320, {1, 16, 48, 64, 128}},
+    Geometry{12800, 2560, {1, 8, 16, 32, 48, 64, 96, 128, 512}},
+    Geometry{248320, 2560, {1, 8, 16, 32, 64, 96}},
+    Geometry{13952, 2560, {1, 8, 16, 32, 48, 64, 96, 128, 512}},
+    Geometry{2560, 6144, {1, 8, 16, 32, 64, 96, 128, 512}},
+    Geometry{2560, 2560, {1, 8, 32, 48, 64, 96, 128, 512, 2048}},
+    Geometry{1152, 1536, {8, 16, 32, 64, 128, 256, 512, 1024, 2048}, ColumnDomain::RawPatch},
+    Geometry{3456, 1152, {4, 16, 96, 128, 256, 512, 1024}, ColumnDomain::RawPatch},
+    Geometry{1152, 1152, {4, 16, 32, 40, 64, 128, 256, 512, 1024, 2048}, ColumnDomain::RawPatch},
+    Geometry{4304, 1152, {32, 96, 128, 256, 512, 1024, 2048}, ColumnDomain::RawPatch},
+    Geometry{1152, 4304, {16, 32, 40, 64, 116, 128, 256, 512, 1024, 2048}, ColumnDomain::RawPatch},
+    Geometry{4608, 4608, {1, 2, 3, 4, 16, 32, 64, 96, 128, 256, 512}, ColumnDomain::Merger},
+    Geometry{2560, 4608, {1, 2, 8, 24, 64, 96, 128, 256, 512}, ColumnDomain::Merger},
+};
+
+ninfer::test::quantized_weight::PackedWeight cancellation_weight(int n, int k, std::uint32_t seed) {
+    auto result = ninfer::test::linear::make_bf16_weight(n, k, seed);
+    for (int row = 0; row < n; ++row) {
+        for (int column = 0; column < k; column += 2) {
+            const auto offset = (static_cast<std::size_t>(row) * k + column) * 2;
+            auto value =
+                ninfer::test::quantized_weight::detail::load_u16_le(result.payload, offset);
+            if (column == k - 2 && (value & 0x7fff) == 0) value = 0x3d80;
+            ninfer::test::quantized_weight::detail::store_u16_le(result.payload, offset, value);
+            ninfer::test::quantized_weight::detail::store_u16_le(result.payload, offset + 2, value);
+        }
+    }
+    return result;
+}
+
+int run_new_bf16_geometry(const Geometry& shape) {
+    using namespace ninfer::test::linear;
+    const bool raw    = shape.domain == ColumnDomain::RawPatch;
+    const bool text   = shape.domain == ColumnDomain::Text;
+    const int step    = raw ? 4 : 1;
+    const int maximum = raw ? 131072 : text ? std::numeric_limits<int>::max() : 32768;
+    const bool wide   = shape.n == 2560 && shape.k == 2560;
+    int failures      = 0;
+    for (const auto policy :
+         {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8, ops::LinearPolicy::AllowA4}) {
+        if (ops::linear_workspace_capacity_bytes(QType::BF16, shape.n, shape.k, policy, step,
+                                                 maximum) != 0) {
+            std::cerr << "BF16: expected zero workspace across the admitted column domain\n";
+            ++failures;
+        }
+        std::vector<std::pair<int, int>> invalid{{0, step}, {-1, step}, {8, 4}};
+        if (!text) invalid.push_back({step, maximum + step});
+        if (raw) invalid.insert(invalid.end(), {{1, 4}, {4, 5}, {3, 8}});
+        for (auto [lo, hi] : invalid) {
+            try {
+                (void)ops::linear_workspace_capacity_bytes(QType::BF16, shape.n, shape.k, policy,
+                                                           lo, hi);
+                std::cerr << "BF16: accepted an invalid column domain\n";
+                ++failures;
+            } catch (const std::invalid_argument&) {}
+        }
+        if (!text) {
+            for (auto [lo, hi] :
+                 {std::pair{step, 128}, std::pair{512, 1024}, std::pair{maximum - step, maximum}}) {
+                const auto capacity = ops::linear_workspace_capacity_bytes(QType::BF16, shape.n,
+                                                                           shape.k, policy, lo, hi);
+                for (int t = lo; t <= hi; t += step) {
+                    if (ops::linear_workspace_capacity_bytes(QType::BF16, shape.n, shape.k, policy,
+                                                             t, t) > capacity) {
+                        std::cerr << "BF16: insufficient vision workspace envelope\n";
+                        ++failures;
+                    }
+                }
+            }
+        }
+    }
+    if (text) failures += verify_workspace_envelopes(QType::BF16, shape.n, shape.k);
+    if (raw) {
+        DeviceWeight weight(make_patterned(shape.n, shape.k, 503U));
+        DeviceBuffer input(static_cast<std::size_t>(shape.k) * 8 * 2);
+        DeviceBuffer output(static_cast<std::size_t>(shape.n) * 8 * 2);
+        DeviceArena scratch(256);
+        for (int t : {1, 3, 5, 7}) {
+            Tensor x(input.p, DType::BF16, {shape.k, t});
+            Tensor y(output.p, DType::BF16, {shape.n, t});
+            for (bool convenience : {false, true}) {
+                try {
+                    if (convenience)
+                        ops::linear(x, weight.view(), y, nullptr);
+                    else
+                        ops::linear(x, weight.view(), y, ops::LinearPolicy::A16Only, scratch,
+                                    nullptr);
+                    std::cerr << "BF16: accepted an invalid raw-patch extent\n";
+                    ++failures;
+                } catch (const std::invalid_argument&) {}
+            }
+        }
+    }
+    std::set<int> points;
+    if (shape.n <= 640 || raw) {
+        for (int t = step; t <= 128; t += step) points.insert(t);
+    } else {
+        for (int t : {1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128})
+            points.insert(t);
+    }
+    points.insert({raw ? 132 : 129, 256, 512, 1024});
+    if (!raw) points.insert(1025);
+    if (raw || wide) points.insert({2048, 4096});
+    if (!text) points.insert({maximum - step, maximum});
+    for (int end : shape.boundaries)
+        for (int t : {end - step, end, end + step})
+            if (t >= step && t <= maximum && t % step == 0) points.insert(t);
+    std::vector<Invocation> calls;
+    for (int t : points) calls.push_back({t});
+    std::set<int> anchors{step, 4, 8, 128, 512, 1024};
+    if (!text) anchors.insert(256);
+    if (raw || wide) anchors.insert({2048, 4096});
+    for (int t : anchors) {
+        calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+        calls.push_back({t, CallForm::A16Convenience});
+    }
+    for (int end : shape.boundaries) {
+        for (int t : {end, end + step})
+            if (t >= step && t <= maximum && t % step == 0)
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+        if (end >= step && end % step == 0) calls.push_back({end, CallForm::A16Convenience});
+    }
+    calls.push_back({raw ? 20 : 17, CallForm::Policy, ops::LinearPolicy::AllowA8});
+    calls.push_back({64, CallForm::Policy, ops::LinearPolicy::AllowA4});
+    const std::uint32_t seed = static_cast<std::uint32_t>(shape.n + shape.k + 431);
+    failures += run_shape("BF16_A16", ActivationCompute::A16, make_bf16_weight,
+                          {shape.n, shape.k, seed,
+                           shape.n <= 640 ? Comparison::Full : Comparison::Sampled, true, calls});
+    if (shape.n > 640) {
+        std::set<int> full_points{step, 4, 8};
+        std::vector<Invocation> full;
+        for (int t : full_points) full.push_back({t});
+        failures += run_shape("BF16_A16 full", ActivationCompute::A16, make_bf16_weight,
+                              {shape.n, shape.k, seed + 1, Comparison::Full, true, full});
+    }
+    if (shape.n <= 640 || shape.k == 320 || shape.k % 64 != 0) {
+        std::set<int> tail_points{step, 4, 8, 128};
+        std::vector<Invocation> tail;
+        for (int t : tail_points) tail.push_back({t});
+        tail.push_back({128, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+        failures += run_shape("BF16_A16 K tail", ActivationCompute::A16, make_bf16_weight,
+                              {shape.n, shape.k, seed + 2,
+                               shape.n <= 640 ? Comparison::Full : Comparison::Sampled, true, tail,
+                               ActivationPattern::KTail});
+    }
+    if (shape.n <= 96) {
+        const std::array cancel{Invocation{1}, Invocation{4}, Invocation{8}, Invocation{128},
+                                Invocation{8, CallForm::Policy, ops::LinearPolicy::A16Only, true}};
+        failures += run_shape("BF16_A16 cancellation", ActivationCompute::A16, cancellation_weight,
+                              {shape.n, shape.k, seed + 3, Comparison::Full, true, cancel,
+                               ActivationPattern::Cancellation});
+    }
+    return failures;
+}
+
+int run_new_bf16(int selected_n = 0, int selected_k = 0) {
+    int failures = 0;
+    bool found   = selected_n == 0;
+    for (const auto& shape : kNewGeometries) {
+        if (selected_n && (shape.n != selected_n || shape.k != selected_k)) continue;
+        found = true;
+        failures += run_new_bf16_geometry(shape);
+    }
+    if (!found) throw std::invalid_argument("BF16 test: unknown geometry");
+    return failures;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (ninfer::test::cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
 
     try {
-        const int failures = run_bf16_linear();
+        int n = 0, k = 0;
+        if (argc == 4 && std::string_view(argv[1]) == "--shape") {
+            n = std::stoi(argv[2]);
+            k = std::stoi(argv[3]);
+            if (n <= 0 || k <= 0) throw std::invalid_argument("BF16 test: positive N/K required");
+        } else if (argc != 1) {
+            throw std::invalid_argument("usage: ninfer_linear_bf16_a16_test [--shape N K]");
+        }
+        const int failures = (n == 0 ? run_bf16_linear() : 0) + run_new_bf16(n, k);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " BF16_A16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
