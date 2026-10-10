@@ -3,9 +3,29 @@
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_output.cuh"
 
+#include <stdexcept>
+
+// Build-level capability switch; see cmake/NinferTargets.cmake.
+#if !defined(NINFER_ARCH_SM89)
+#define NINFER_ARCH_SM89 0
+#endif
+
 namespace ninfer::ops::detail {
 void nvfp4_attn_input_a16_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                  Tensor& k, Tensor& v, cudaStream_t stream) {
+#if NINFER_ARCH_SM89
+    // NVFP4 parameter storage and its MMA routes exist only on sm_120a in this tree;
+    // sm_89 artifacts use the groupwise-int and Q4/Q5/Q8 representations instead.
+    (void)x;
+    (void)weight;
+    (void)q;
+    (void)gate;
+    (void)k;
+    (void)v;
+    (void)stream;
+    throw std::invalid_argument(
+        "NVFP4 attention input requires an sm_120a GPU; this build targets sm_89");
+#else
     const int tokens = x.ne[1];
     if (tokens == 1) {
         nvfp4_attn_input_decode_launch(x, weight, q, gate, k, v, stream);
@@ -59,5 +79,6 @@ void nvfp4_attn_input_a16_launch(const Tensor& x, const Weight& weight, Tensor& 
             p, output, epilogue, stream);
         return;
     }
+#endif // NINFER_ARCH_SM89
 }
 } // namespace ninfer::ops::detail

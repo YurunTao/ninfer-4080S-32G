@@ -10,6 +10,12 @@
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <stdexcept>
+
+// Build-level capability switch; see cmake/NinferTargets.cmake.
+#if !defined(NINFER_ARCH_SM89)
+#define NINFER_ARCH_SM89 0
+#endif
 
 namespace ninfer::ops::detail {
 namespace {
@@ -42,6 +48,21 @@ void launch_gemm(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tenso
 void nvfp4_attn_input_a4_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                 Tensor& k, Tensor& v, Nvfp4A4Workspace workspace,
                                 cudaStream_t stream) {
+#if NINFER_ARCH_SM89
+    // The A4 route is built from Blackwell block-scale MMA and Hopper-or-newer TMA.
+    // Neither exists below sm_90, so the route is not compiled on this branch and
+    // the caller gets an explicit rejection instead of a silent numerical fallback.
+    (void)x;
+    (void)weight;
+    (void)q;
+    (void)gate;
+    (void)k;
+    (void)v;
+    (void)workspace;
+    (void)stream;
+    throw std::invalid_argument(
+        "NVFP4 A4 attention input requires an sm_120a GPU; this build targets sm_89");
+#else
     const std::int32_t tokens = x.ne[1];
     const auto layout =
         uses_tma(tokens) ? (tokens < 1024 ? Nvfp4ScaleLayout::Tiled128 : Nvfp4ScaleLayout::Tiled256)
@@ -67,6 +88,7 @@ void nvfp4_attn_input_a4_launch(const Tensor& x, const Weight& weight, Tensor& q
     } else {
         launch_gemm<M128N128Resident>(weight, q, gate, k, v, workspace, tokens, stream);
     }
+#endif // NINFER_ARCH_SM89
 }
 
 } // namespace ninfer::ops::detail

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/mbarrier.cuh"
+#include "ops/common/memory.cuh"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
 #include "ops/linear/common/epilogue.cuh"
@@ -14,7 +15,14 @@
 #include <string>
 #include <type_traits>
 
+// Build-level capability switch; see cmake/NinferTargets.cmake.
+#if !defined(NINFER_ARCH_SM89)
+#define NINFER_ARCH_SM89 0
+#endif
+
 namespace ninfer::ops::detail {
+
+#if !NINFER_ARCH_SM89
 
 struct alignas(128) Fp8TmaDescriptors {
     CUtensorMap activation;
@@ -83,6 +91,8 @@ __device__ __forceinline__ void fp8_tma_load(void* destination, const CUtensorMa
                  : "memory");
 }
 
+#endif // !NINFER_ARCH_SM89
+
 template <class Schedule, class Epilogue>
 inline constexpr int fp8_tma_scratch_bytes = [] {
     constexpr int epilogue_bytes = [] {
@@ -95,6 +105,133 @@ inline constexpr int fp8_tma_scratch_bytes = [] {
         Schedule::kStorageBytes > epilogue_bytes ? Schedule::kStorageBytes : epilogue_bytes;
     return (bytes + 127) / 128 * 128;
 }();
+
+#if NINFER_ARCH_SM89
+
+// sm_89 route: identical tiles, pipeline depth, MMA schedule and epilogue, but the
+// staged operands come from cp.async instead of TMA descriptors, and the producer /
+// consumer handshake uses __syncthreads() instead of sm_90 mbarrier transactions.
+// Every thread stages and every thread computes, so no producer warp group is reserved.
+// Split-K is not part of this route: the Ada target relies on the full-tile schedules.
+
+// Copies a (rows x block_k) E4M3 tile. `row_of` maps a logical tile row to its global row,
+// which lets the paired row policy keep each warp's contiguous gate/up spans unrepacked.
+template <class Schedule, class RowOf>
+__device__ __forceinline__ void fp8_cpasync_tile(const std::uint8_t* source, int pitch, int k_begin,
+                                                 int rows, RowOf row_of, std::uint8_t* destination) {
+    constexpr int BK = Schedule::kBlockK;
+    constexpr int kVec = 16; // 16-byte cp.async granularity for E4M3
+    static_assert(BK % kVec == 0);
+    const int k_tiles = BK / kVec;
+    for (int index = threadIdx.x; index < rows * k_tiles; index += blockDim.x) {
+        const int row = index / k_tiles, col = (index % k_tiles) * kVec;
+        cp_async<16>(destination + row * BK + col,
+                     source + static_cast<std::int64_t>(row_of(row)) * pitch + k_begin + col);
+    }
+}
+
+template <class Schedule, bool FullTokens, class Output, class Epilogue, class RowPolicy>
+__global__
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma_mma_kernel(
+    Fp8A8Operands operands, Output output, Epilogue epilogue, RowPolicy row_policy, int token_offset,
+    int count) {
+    constexpr int BT = Schedule::kBlockTokens, BR = Schedule::kBlockRows;
+    constexpr int BK = Schedule::kBlockK, S = Schedule::kStages;
+    const int k         = Schedule::kStaticK ? Schedule::kStaticK : operands.k;
+    const int tiles_k   = k / BK;
+    const int row_tiles = operands.rows / BR, token_tiles = div_up(count, BT);
+    int row_tile, token_tile;
+    fp8_mma_tile_coordinates<Schedule>(blockIdx.x, row_tiles, token_tiles, row_tile, token_tile);
+    const int row_begin   = row_tile * (BR / (RowPolicy::kPaired ? 2 : 1));
+    const int token_begin = token_offset + token_tile * BT;
+
+    extern __shared__ __align__(128) unsigned char fp8_tma_shared[];
+    auto* activation = fp8_tma_shared;
+    auto* weight     = activation + S * BT * BK;
+
+    const auto activation_row = [&](int row) { return token_begin + row; };
+    const int weight_span     = RowPolicy::kPaired ? Schedule::kWarpRows / 2 : BR;
+    const auto weight_copy    = [&](int kt, int stage) {
+        if constexpr (RowPolicy::kPaired) {
+#pragma unroll
+            for (int local = 0; local < BR; local += weight_span) {
+                fp8_cpasync_tile<Schedule>(operands.codes, k, kt * BK, weight_span,
+                                           [&](int row) {
+                                               return row_policy.weight_row(row_begin, local + row,
+                                                                            operands.rows);
+                                           },
+                                           weight + (stage * BR + local) * BK);
+            }
+        } else {
+            fp8_cpasync_tile<Schedule>(operands.codes, k, kt * BK, BR,
+                                       [&](int row) { return row_begin + row; },
+                                       weight + stage * BR * BK);
+        }
+    };
+    const auto stage_tiles = [&](int kt, int stage) {
+        const int tokens = token_begin + BT > token_offset + count ? token_offset + count - token_begin
+                                                                   : BT;
+        fp8_cpasync_tile<Schedule>(operands.x, k, kt * BK, tokens, activation_row,
+                                   activation + stage * BT * BK);
+        weight_copy(kt, stage);
+        cp_commit();
+    };
+
+#pragma unroll
+    for (int kt = 0; kt < (tiles_k < S ? tiles_k : S); ++kt) { stage_tiles(kt, kt % S); }
+
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5, lane = tid & 31;
+    float accumulators[Schedule::kMmaTokens][Schedule::kMmaRows][4] = {};
+    for (int kt = 0; kt < tiles_k; ++kt) {
+        const int stage = kt % S;
+        if (kt + S < tiles_k) {
+            cp_wait<S - 1>();
+            stage_tiles(kt + S, stage);
+        } else {
+            cp_wait<0>();
+        }
+        __syncthreads();
+        fp8_mma_compute_stage<Schedule>(activation + stage * BT * BK, weight + stage * BR * BK,
+                                        accumulators, warp, lane);
+        __syncthreads();
+    }
+    fp8_finish_mma_tile<Schedule, FullTokens>(
+        output, epilogue, row_policy, fp8_tma_shared, accumulators, operands.x_scales,
+        operands.scales, row_begin, token_begin, operands.rows, token_offset + count, warp, lane);
+}
+
+template <class Schedule, class Output, class Epilogue, class RowPolicy = Fp8IdentityRows>
+void launch_fp8_a8_tma_mma(const Fp8A8Operands& p, Output output, Epilogue epilogue,
+                           cudaStream_t stream, float* partials = nullptr,
+                           RowPolicy row_policy = {}) {
+    validate_fp8_operands<Schedule>(p);
+    if (p.rows % Schedule::kBlockRows || p.k % Schedule::kBlockK)
+        throw std::invalid_argument("FP8 MMA requires complete row/K tiles");
+    if (partials != nullptr)
+        throw std::invalid_argument("FP8 split-K is unavailable on this build");
+    if constexpr (RowPolicy::kPaired) {
+        static_assert(RowPolicy::kWarpPaired && RowPolicy::kContiguousPairs);
+        static_assert(Schedule::kWarpRows % 16 == 0);
+    }
+    for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+        const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
+        const auto launch = [&]<bool Full>() {
+            constexpr auto kernel = fp8_a8_tma_mma_kernel<Schedule, Full, Output, Epilogue, RowPolicy>;
+            constexpr int bytes   = fp8_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
+            const int dynamic     = fp8_prepare_shared<bytes, kernel, true>();
+            kernel<<<blocks, Schedule::kThreads, dynamic, stream>>>(p, output, epilogue, row_policy,
+                                                                    offset, count);
+            CUDA_CHECK(cudaGetLastError());
+        };
+        if (count % Schedule::kBlockTokens == 0)
+            launch.template operator()<true>();
+        else
+            launch.template operator()<false>();
+    });
+}
+
+#else
 
 template <class Schedule, bool FullTokens, class Output, class Epilogue, bool SplitK = false,
           class RowPolicy = Fp8IdentityRows>
@@ -331,5 +468,7 @@ void launch_fp8_a8_tma_mma(const Fp8A8Operands& p, Output output, Epilogue epilo
             launch.template operator()<false, false>();
     });
 }
+
+#endif // NINFER_ARCH_SM89
 
 } // namespace ninfer::ops::detail
