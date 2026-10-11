@@ -765,6 +765,27 @@ def layout(entry, directory, payload):
         reserve = align(32 + len(data)) - 32
 
 
+def _descriptor(handle):
+    """Accept either a file object or a raw descriptor."""
+    return handle if isinstance(handle, int) else handle.fileno()
+
+
+def _sync_output(handle):
+    """Flush one output file's data to stable storage.
+
+    fdatasync is POSIX-only; Windows has no data-only sync, so fsync is the correct
+    equivalent there. Both are advisory with respect to the upgrade's result.
+    """
+    sync = getattr(os, "fdatasync", None) or os.fsync
+    sync(_descriptor(handle))
+
+
+def _drop_cache(handle, offset=0, length=0):
+    """Advisory page-cache drop; a no-op where the platform offers no equivalent."""
+    fadvise = getattr(os, "posix_fadvise", None)
+    if fadvise is not None:
+        fadvise(_descriptor(handle), offset, length, os.POSIX_FADV_DONTNEED)
+
 def upgrade(input_path, output_path):
     input_path, output_path = Path(input_path), Path(output_path)
     if input_path.resolve() == output_path.resolve():
@@ -828,11 +849,8 @@ def upgrade(input_path, output_path):
                             )
                             if not chunk:
                                 raise ValueError("v2 payload ended prematurely")
-                            os.posix_fadvise(
-                                source.fileno(),
-                                source.tell() - len(chunk),
-                                len(chunk),
-                                os.POSIX_FADV_DONTNEED,
+                            _drop_cache(
+                                source, source.tell() - len(chunk), len(chunk)
                             )
                         elif cursor < template_offset:
                             chunk = bytes(min(remaining, template_offset - cursor))
@@ -845,15 +863,13 @@ def upgrade(input_path, output_path):
                         pending += len(chunk)
                         if pending >= WRITEBACK:
                             output.flush()
-                            os.fdatasync(output.fileno())
-                            os.posix_fadvise(
-                                output.fileno(), 0, 0, os.POSIX_FADV_DONTNEED
-                            )
+                            _sync_output(output.fileno())
+                            _drop_cache(output)
                             pending = 0
                     output.flush()
-                    os.fdatasync(output.fileno())
-                    os.posix_fadvise(output.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-            os.posix_fadvise(source.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                    _sync_output(output.fileno())
+                    _drop_cache(output)
+            _drop_cache(source)
         for index in [*range(1, len(targets)), 0]:
             os.link(temporary[index], targets[index])
             published.append(targets[index])

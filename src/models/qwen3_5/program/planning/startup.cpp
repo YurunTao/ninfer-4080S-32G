@@ -809,8 +809,20 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         break;
     }
-    if (device.compute_capability() != 120) {
-        throw std::invalid_argument("Qwen3.5 family runtime requires compute capability 12.0");
+    // The kernels are compiled for one architecture per build. A device below that
+    // architecture cannot execute them, so require at least the compiled target rather
+    // than a fixed Blackwell revision: this branch builds for sm_89, where the TMA and
+    // block-scale-MLA-free routes take over from the sm_120a kernels.
+#if defined(NINFER_ARCH_SM89)
+    constexpr int kCompiledComputeCapability = 89;
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    constexpr int kCompiledComputeCapability = 100;
+#else
+    constexpr int kCompiledComputeCapability = 120;
+#endif
+    if (device.compute_capability() < kCompiledComputeCapability) {
+        throw std::invalid_argument(
+            "this build requires a GPU of the architecture it was compiled for");
     }
 }
 
