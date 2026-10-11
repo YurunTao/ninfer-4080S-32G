@@ -95,13 +95,6 @@ public:
         return out;
     }
 
-    // The scoring core has no failure latch of its own - a failed score throws to its
-    // caller rather than latching - so it is healthy until it is stopping.
-    [[nodiscard]] bool healthy() const noexcept {
-        std::lock_guard lock(queue_mutex_);
-        return !stopping_;
-    }
-
     [[nodiscard]] RuntimeStats runtime_stats() const noexcept { return {}; }
 
     [[nodiscard]] bool is_available() const {

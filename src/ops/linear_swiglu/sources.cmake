@@ -16,6 +16,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_linear_swiglu_gemm_splitk.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_linear_swiglu_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/../wrapper/linear_swiglu.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_swiglu_int8.cu"
 )
 
 target_sources(ninfer_nvfp4_non_rdc PRIVATE

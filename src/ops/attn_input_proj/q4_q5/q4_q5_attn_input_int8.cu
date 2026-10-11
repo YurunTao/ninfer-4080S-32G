@@ -19,7 +19,7 @@ constexpr std::int32_t kKvRows    = 1024;
 Int8ProjJob make_job(const Weight& weight, std::int32_t row_begin, std::int32_t row_count,
                      Tensor& out) {
     const std::int64_t groups = weight.padded_shape[1] / 64;
-    const bool q5             = weight.qtype == QType::Q5G64_F16S;
+    const bool q5             = weight.qtype == QType::Q5_G64_FP16;
     return Int8ProjJob{
         static_cast<const std::uint8_t*>(weight.qdata) +
             static_cast<std::int64_t>(row_begin) * groups * 32,

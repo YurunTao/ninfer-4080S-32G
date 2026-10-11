@@ -1,16 +1,62 @@
 #pragma once
 
-// Runtime request contracts.
-//
-// The merge of upstream's contract split (request.h / execution.h / resources.h /
-// timing.h) with this branch's single contract header (types.h) left the same
-// runtime types declared twice, and the branch's engine, planner and generation
-// layer all depend on types.h. The two headers therefore hold one contract with a
-// single definition site: types.h owns the declarations and this header forwards,
-// so every existing `runtime/contract/request.h` include keeps working.
-//
-// The engine-side fields this header used to add on top of types.h are declared
-// there instead: ResolvedExecutionOptions, ResolvedRequestOptions,
-// ContinuationAction, OutputDecision, CancellationFlagView and RequestPlanSummary.
+#include "ninfer/types.h"
+#include <atomic>
+#include <cstdint>
+#include <optional>
 
-#include "runtime/contract/types.h"
+namespace ninfer::runtime {
+
+// Engine has already selected the model/mode preset, applied every explicit override,
+// and validated these values before constructing the runtime request.
+struct ResolvedExecutionOptions {
+    ResolvedSamplingParameters sampling;
+    std::uint32_t requested_output_tokens = 0;
+    bool allow_prefix_reuse               = true;
+    ThinkingControlOptions thinking;
+};
+
+struct ResolvedRequestOptions {
+    std::optional<OutputConstraint> constraint;
+    ToolChoice tool_choice;
+    ResolvedExecutionOptions execution;
+    StopPolicy stop;
+    OutputOptions output;
+};
+
+enum class ContinuationAction : std::uint8_t {
+    Decode,
+    ApplyTargetControl,
+};
+
+struct OutputDecision {
+    std::uint32_t accepted_tokens   = 0;
+    FinishReason finish_reason      = FinishReason::None;
+    ContinuationAction continuation = ContinuationAction::Decode;
+    // Empty or one token-aligned frontier within the accepted span where model-history
+    // reconstruction gains an execution split. Frontend owns detection; Engine only transports
+    // this relative position.
+    std::optional<std::uint32_t> prefix_execution_split_after;
+
+    [[nodiscard]] bool finished() const noexcept { return finish_reason != FinishReason::None; }
+};
+
+// Non-owning cancellation observation used while the worker advances a context transaction. The
+// request record owns the flag for longer than Program can retain this view.
+struct CancellationFlagView {
+    const std::atomic<bool>* flag = nullptr;
+
+    [[nodiscard]] bool requested() const noexcept {
+        return flag != nullptr && flag->load(std::memory_order_acquire);
+    }
+};
+
+struct RequestPlanSummary {
+    std::uint32_t prompt_tokens           = 0;
+    std::uint32_t requested_output_tokens = 0;
+    std::uint32_t effective_output_tokens = 0;
+    FinishReason effective_limit_reason   = FinishReason::None;
+    bool publish_continuation             = true;
+};
+
+} // namespace ninfer::runtime

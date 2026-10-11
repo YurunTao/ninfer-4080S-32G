@@ -23,6 +23,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_dflash2_attn_input.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_attn_input_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/../wrapper/attn_input_proj.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/q4_q5/q4_q5_attn_input_int8.cu"
 )
 
 target_sources(ninfer_nvfp4_non_rdc PRIVATE

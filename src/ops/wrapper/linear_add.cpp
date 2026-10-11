@@ -106,7 +106,7 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
             throw std::invalid_argument("linear_add workspace: Q5 admits only A16 or A8");
         }
         return detail::q5_linear_add_capacity_workspace_bytes(output_rows, input_rows, input_rows,
-                                                              min_tokens, max_tokens, policy);
+                                                              min_tokens, max_tokens);
     }
     if (qtype == QType::NVFP4) {
         const bool supported = (output_rows == detail::Nvfp4N5120K6144::kOutputRows &&
@@ -179,7 +179,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument(
                 "linear_add: Q5 requires 16-byte x/residual/code/high/scale alignment");
         }
-        detail::q5_linear_add_dispatch(x, w, residual_out, ws, policy, stream);
+        detail::q5_linear_add_dispatch(x, w, residual_out, ws, stream);
         return;
     }
 
